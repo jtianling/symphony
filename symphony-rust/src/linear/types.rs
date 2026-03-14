@@ -54,7 +54,8 @@ pub struct LinearIssue {
     pub updated_at: Option<String>,
     pub state: Option<StateNode>,
     pub labels: Option<LabelsConnection>,
-    pub relations: Option<RelationsConnection>,
+    #[serde(rename = "inverseRelations")]
+    pub inverse_relations: Option<InverseRelationsConnection>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -74,15 +75,16 @@ pub struct LabelNode {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-pub struct RelationsConnection {
+pub struct InverseRelationsConnection {
     #[serde(default)]
-    pub nodes: Vec<RelationNode>,
+    pub nodes: Vec<InverseRelationNode>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
-pub struct RelationNode {
-    #[serde(rename = "relatedIssue")]
-    pub related_issue: Option<RelatedIssue>,
+pub struct InverseRelationNode {
+    #[serde(rename = "type")]
+    pub relation_type: Option<String>,
+    pub issue: Option<RelatedIssue>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

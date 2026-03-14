@@ -1,6 +1,6 @@
 use crate::domain::{BlockerRef, Issue};
 
-use super::types::{LinearIssue, RelatedIssue};
+use super::types::LinearIssue;
 
 pub fn normalize_issue(linear: &LinearIssue) -> Issue {
     Issue {
@@ -27,14 +27,24 @@ pub fn normalize_issue(linear: &LinearIssue) -> Issue {
             })
             .unwrap_or_default(),
         blocked_by: linear
-            .relations
+            .inverse_relations
             .as_ref()
             .map(|relations| {
                 relations
                     .nodes
                     .iter()
-                    .filter_map(|relation| relation.related_issue.as_ref())
-                    .map(normalize_related_issue)
+                    .filter(|node| {
+                        node.relation_type
+                            .as_deref()
+                            .map(|t| t.trim().eq_ignore_ascii_case("blocks"))
+                            .unwrap_or(false)
+                    })
+                    .filter_map(|node| node.issue.as_ref())
+                    .map(|issue| BlockerRef {
+                        id: issue.id.clone(),
+                        identifier: issue.identifier.clone(),
+                        state: extract_state_name(issue.state.as_ref()),
+                    })
                     .collect()
             })
             .unwrap_or_default(),
@@ -48,14 +58,6 @@ pub(crate) fn normalize_issue_ref(linear: &LinearIssue) -> BlockerRef {
         id: linear.id.clone(),
         identifier: linear.identifier.clone(),
         state: extract_state_name(linear.state.as_ref()),
-    }
-}
-
-fn normalize_related_issue(issue: &RelatedIssue) -> BlockerRef {
-    BlockerRef {
-        id: issue.id.clone(),
-        identifier: issue.identifier.clone(),
-        state: extract_state_name(issue.state.as_ref()),
     }
 }
 
@@ -100,13 +102,22 @@ mod tests {
                     { "name": "" }
                 ]
             },
-            "relations": {
+            "inverseRelations": {
                 "nodes": [
                     {
-                        "relatedIssue": {
+                        "type": "blocks",
+                        "issue": {
                             "id": "issue-0",
                             "identifier": "SYM-0",
                             "state": { "name": "In Progress" }
+                        }
+                    },
+                    {
+                        "type": "related",
+                        "issue": {
+                            "id": "issue-2",
+                            "identifier": "SYM-2",
+                            "state": { "name": "Done" }
                         }
                     }
                 ]

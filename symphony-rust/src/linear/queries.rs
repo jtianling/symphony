@@ -21,9 +21,10 @@ query($projectSlug: String!, $states: [String!]!, $after: String) {
       updatedAt
       state { name }
       labels { nodes { name } }
-      relations(filter: { type: { eq: "blocks" } }) {
+      inverseRelations(first: 50) {
         nodes {
-          relatedIssue {
+          type
+          issue {
             id
             identifier
             state { name }

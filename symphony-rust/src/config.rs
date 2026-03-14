@@ -226,7 +226,20 @@ impl SymphonyConfig {
     }
 
     fn resolve_runtime_values(&mut self) {
-        self.tracker.api_key = self.tracker.api_key.as_deref().and_then(resolve_env_var);
+        self.tracker.api_key = self
+            .tracker
+            .api_key
+            .as_deref()
+            .and_then(resolve_env_var)
+            .or_else(|| {
+                if self.tracker.kind.as_deref() == Some("linear") {
+                    std::env::var("LINEAR_API_KEY")
+                        .ok()
+                        .filter(|v| !v.is_empty())
+                } else {
+                    None
+                }
+            });
 
         self.workspace.root = self
             .workspace
