@@ -1,21 +1,24 @@
 use std::fmt;
 use std::path::Path;
 use std::process::Stdio;
+use std::sync::Arc;
 use std::time::Duration;
 
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter};
 use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command};
 use tokio::time::{self, Instant};
-use tracing::debug;
+use tracing::{debug, info, warn};
 
 use crate::domain::RunOutcome;
 use crate::error::SymphonyError;
+use crate::ssh;
 
 use super::events::{parse_event, CodexEvent};
+use super::tools::LinearGraphqlTool;
 
-const DEFAULT_READ_TIMEOUT_MS: u64 = 30_000;
-const DEFAULT_TURN_TIMEOUT_MS: u64 = 1_800_000;
+const DEFAULT_READ_TIMEOUT_MS: u64 = 5_000;
+const DEFAULT_TURN_TIMEOUT_MS: u64 = 3_600_000;
 const DEFAULT_APPROVAL_ACTIONS: [&str; 2] = ["command_execution", "file_changes"];
 
 pub struct AppServer {
@@ -29,6 +32,7 @@ pub struct AppServer {
     sandbox: String,
     current_thread_id: Option<String>,
     current_turn_id: Option<String>,
+    tool_executor: Option<Arc<LinearGraphqlTool>>,
 }
 
 impl fmt::Debug for AppServer {
@@ -42,6 +46,7 @@ impl fmt::Debug for AppServer {
             .field("sandbox", &self.sandbox)
             .field("current_thread_id", &self.current_thread_id)
             .field("current_turn_id", &self.current_turn_id)
+            .field("has_tool_executor", &self.tool_executor.is_some())
             .finish()
     }
 }
@@ -80,26 +85,30 @@ enum TurnAction {
     Continue,
     Complete(RunOutcome),
     AutoApprove(Value),
-    RejectToolCall(Value),
+    ExecuteToolCall { id: Value, name: String, params: Value },
 }
 
 impl AppServer {
     pub async fn launch(
         command: &str,
         cwd: &Path,
+        worker_host: Option<&str>,
         read_timeout_ms: u64,
         turn_timeout_ms: u64,
     ) -> Result<Self, SymphonyError> {
-        let mut child = Command::new("bash")
-            .arg("-lc")
-            .arg(command)
-            .current_dir(cwd)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(|error| SymphonyError::Codex(format!("launch_failed: {error}")))?;
+        let child = match worker_host {
+            Some(worker_host) => launch_remote(command, cwd, worker_host)?,
+            None => launch_local(command, cwd)?,
+        };
 
+        Self::from_child(child, read_timeout_ms, turn_timeout_ms)
+    }
+
+    fn from_child(
+        mut child: Child,
+        read_timeout_ms: u64,
+        turn_timeout_ms: u64,
+    ) -> Result<Self, SymphonyError> {
         let stdin = child
             .stdin
             .take()
@@ -126,7 +135,12 @@ impl AppServer {
             sandbox: "workspace-write".into(),
             current_thread_id: None,
             current_turn_id: None,
+            tool_executor: None,
         })
+    }
+
+    pub fn set_tool_executor(&mut self, tool: Arc<LinearGraphqlTool>) {
+        self.tool_executor = Some(tool);
     }
 
     pub async fn initialize(&mut self) -> Result<String, SymphonyError> {
@@ -160,11 +174,11 @@ impl AppServer {
     pub async fn start_thread(
         &mut self,
         cwd: &str,
-        approval_policy: &str,
+        approval_policy: &Value,
         sandbox: &str,
     ) -> Result<String, SymphonyError> {
         let request_id = self.next_request_id();
-        self.approval_policy = parse_approval_policy(approval_policy);
+        self.approval_policy = approval_policy.clone();
         self.sandbox = normalize_sandbox(sandbox);
 
         let request = json!({
@@ -191,6 +205,7 @@ impl AppServer {
         thread_id: &str,
         prompt: &str,
         cwd: &str,
+        sandbox_policy: &Value,
     ) -> Result<String, SymphonyError> {
         let request_id = self.next_request_id();
         let request = json!({
@@ -203,7 +218,7 @@ impl AppServer {
                 "cwd": cwd,
                 "title": "symphony-turn",
                 "approvalPolicy": self.approval_policy.clone(),
-                "sandboxPolicy": self.sandbox
+                "sandboxPolicy": sandbox_policy.clone()
             }
         });
 
@@ -249,6 +264,7 @@ impl AppServer {
             match evaluate_event(
                 event,
                 self.current_turn_id.as_deref(),
+                &self.approval_policy,
                 &mut tokens,
                 &mut rate_limit,
             )? {
@@ -256,8 +272,8 @@ impl AppServer {
                 TurnAction::AutoApprove(id) => {
                     self.handle_approval(&id).await?;
                 }
-                TurnAction::RejectToolCall(id) => {
-                    self.reject_tool_call(&id).await?;
+                TurnAction::ExecuteToolCall { id, name, params } => {
+                    self.handle_tool_call(&id, &name, params).await?;
                 }
                 TurnAction::Complete(outcome) => {
                     self.current_turn_id = None;
@@ -322,11 +338,29 @@ impl AppServer {
     }
 
     async fn handle_approval(&mut self, id: &Value) -> Result<(), SymphonyError> {
+        info!(id = %id, "auto-approving approval request");
         self.send_message(&build_approval_response(id)).await
     }
 
-    async fn reject_tool_call(&mut self, id: &Value) -> Result<(), SymphonyError> {
-        self.send_message(&build_tool_rejection_response(id)).await
+    async fn handle_tool_call(
+        &mut self,
+        id: &Value,
+        name: &str,
+        params: Value,
+    ) -> Result<(), SymphonyError> {
+        let result = match &self.tool_executor {
+            Some(tool) if name == "linear_graphql" => {
+                info!(tool = %name, "executing dynamic tool call");
+                tool.handle(params).await
+            }
+            _ => {
+                warn!(tool = %name, "unsupported dynamic tool call");
+                build_unsupported_tool_result(name)
+            }
+        };
+
+        self.send_message(&build_tool_call_response(id, result))
+            .await
     }
 
     async fn send_message(&mut self, payload: &Value) -> Result<(), SymphonyError> {
@@ -403,9 +437,31 @@ fn spawn_stderr_drain(stderr: ChildStderr) {
     });
 }
 
+fn launch_local(command: &str, cwd: &Path) -> Result<Child, SymphonyError> {
+    Command::new("bash")
+        .arg("-lc")
+        .arg(command)
+        .current_dir(cwd)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| SymphonyError::Codex(format!("launch_failed: {error}")))
+}
+
+fn launch_remote(command: &str, cwd: &Path, worker_host: &str) -> Result<Child, SymphonyError> {
+    let workspace = cwd.to_string_lossy().into_owned();
+    let remote_command = format!("cd {} && exec {command}", ssh::shell_escape(&workspace));
+
+    ssh::start_port(worker_host, &remote_command).map_err(|error| {
+        SymphonyError::Codex(format!("remote_launch_failed on {worker_host}: {error}"))
+    })
+}
+
 fn evaluate_event(
     event: CodexEvent,
     current_turn_id: Option<&str>,
+    approval_policy: &Value,
     tokens: &mut SessionTokens,
     rate_limit: &mut Option<Value>,
 ) -> Result<TurnAction, SymphonyError> {
@@ -445,11 +501,76 @@ fn evaluate_event(
             *rate_limit = Some(payload);
             Ok(TurnAction::Continue)
         }
-        CodexEvent::ApprovalRequest { id, .. } => Ok(TurnAction::AutoApprove(id)),
-        CodexEvent::ToolCall { id, .. } => Ok(TurnAction::RejectToolCall(id)),
-        CodexEvent::UserInputRequired => Err(SymphonyError::Codex("turn_input_required".into())),
+        CodexEvent::ApprovalRequest { id, payload } => {
+            evaluate_approval_request(id, &payload, approval_policy)
+        }
+        CodexEvent::ToolCall { id, name, params } => {
+            Ok(TurnAction::ExecuteToolCall { id, name, params })
+        }
+        CodexEvent::UserInputRequired => {
+            Err(SymphonyError::Codex("turn_input_required".into()))
+        }
         CodexEvent::Unknown(_) => Ok(TurnAction::Continue),
     }
+}
+
+fn evaluate_approval_request(
+    id: Value,
+    payload: &Value,
+    approval_policy: &Value,
+) -> Result<TurnAction, SymphonyError> {
+    if is_reject_policy(approval_policy) {
+        let request_type = extract_approval_request_type(payload);
+        if should_auto_approve_for_reject_policy(approval_policy, &request_type) {
+            info!(
+                request_type = %request_type,
+                "auto-approving via reject policy match"
+            );
+            return Ok(TurnAction::AutoApprove(id));
+        }
+
+        warn!(
+            request_type = %request_type,
+            "rejecting unknown approval type per reject policy"
+        );
+        return Err(SymphonyError::Codex(format!(
+            "approval_required: {request_type}"
+        )));
+    }
+
+    Ok(TurnAction::AutoApprove(id))
+}
+
+fn is_reject_policy(policy: &Value) -> bool {
+    policy.get("reject").is_some()
+}
+
+fn extract_approval_request_type(payload: &Value) -> String {
+    payload
+        .get("kind")
+        .or_else(|| payload.get("type"))
+        .and_then(Value::as_str)
+        .unwrap_or("unknown")
+        .to_owned()
+}
+
+fn should_auto_approve_for_reject_policy(
+    policy: &Value,
+    request_type: &str,
+) -> bool {
+    let Some(reject_map) = policy.get("reject") else {
+        return false;
+    };
+
+    if reject_map.get(request_type).and_then(Value::as_bool) == Some(true) {
+        return true;
+    }
+
+    matches!(
+        request_type,
+        "command_execution" | "file_changes" | "sandbox_approval"
+            | "rules" | "mcp_elicitations"
+    )
 }
 
 fn is_current_turn(current_turn_id: Option<&str>, turn_id: &str) -> bool {
@@ -462,16 +583,6 @@ fn is_current_turn(current_turn_id: Option<&str>, turn_id: &str) -> bool {
 
 fn default_approval_policy() -> Value {
     json!({ "autoApprove": DEFAULT_APPROVAL_ACTIONS })
-}
-
-fn parse_approval_policy(policy: &str) -> Value {
-    let trimmed = policy.trim();
-
-    if trimmed.is_empty() || trimmed == "auto" {
-        return default_approval_policy();
-    }
-
-    serde_json::from_str(trimmed).unwrap_or_else(|_| json!(trimmed))
 }
 
 fn normalize_sandbox(sandbox: &str) -> String {
@@ -526,6 +637,33 @@ fn build_approval_response(id: &Value) -> Value {
     })
 }
 
+fn build_tool_call_response(id: &Value, result: Value) -> Value {
+    json!({
+        "id": id,
+        "result": result,
+    })
+}
+
+fn build_unsupported_tool_result(tool_name: &str) -> Value {
+    let output = serde_json::to_string_pretty(&json!({
+        "error": {
+            "message": format!("Unsupported dynamic tool: {:?}.", tool_name),
+            "supportedTools": ["linear_graphql"],
+        }
+    }))
+    .unwrap_or_default();
+
+    json!({
+        "success": false,
+        "output": output,
+        "contentItems": [{
+            "type": "inputText",
+            "text": output,
+        }],
+    })
+}
+
+#[cfg(test)]
 fn build_tool_rejection_response(id: &Value) -> Value {
     json!({
         "jsonrpc": "2.0",
@@ -542,15 +680,18 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        build_approval_response, build_tool_rejection_response, evaluate_event, SessionTokens,
-        TurnAction,
+        build_approval_response, build_tool_call_response, build_tool_rejection_response,
+        build_unsupported_tool_result, evaluate_event, SessionTokens, TurnAction,
     };
     use crate::codex::events::CodexEvent;
     use crate::domain::RunOutcome;
     use crate::error::SymphonyError;
 
+    fn default_policy() -> serde_json::Value {
+        json!({ "autoApprove": ["command_execution", "file_changes"] })
+    }
+
     #[test]
-    // SPEC 17.5: approval responses follow the JSON-RPC shape required by the app-server.
     fn approval_response_matches_protocol_shape() {
         let payload = build_approval_response(&json!(7));
 
@@ -567,7 +708,6 @@ mod tests {
     }
 
     #[test]
-    // SPEC 17.5: unsupported dynamic tool calls are rejected without stalling the session.
     fn tool_rejection_matches_protocol_shape() {
         let payload = build_tool_rejection_response(&json!(9));
 
@@ -585,8 +725,25 @@ mod tests {
     }
 
     #[test]
-    // SPEC 17.5: token tracking keeps the latest thread totals across repeated usage events.
+    fn tool_call_response_wraps_result() {
+        let result = json!({"success": true, "output": "ok"});
+        let payload = build_tool_call_response(&json!(12), result.clone());
+
+        assert_eq!(payload["id"], json!(12));
+        assert_eq!(payload["result"], result);
+    }
+
+    #[test]
+    fn unsupported_tool_result_contains_error() {
+        let result = build_unsupported_tool_result("unknown_tool");
+
+        assert_eq!(result["success"], json!(false));
+        assert!(result["output"].as_str().unwrap().contains("Unsupported"));
+    }
+
+    #[test]
     fn token_tracking_uses_latest_thread_totals() -> Result<(), SymphonyError> {
+        let policy = default_policy();
         let mut tokens = SessionTokens::default();
         let mut rate_limit = None;
 
@@ -597,6 +754,7 @@ mod tests {
                 total_tokens: 15,
             },
             Some("turn-1"),
+            &policy,
             &mut tokens,
             &mut rate_limit,
         )?;
@@ -607,6 +765,7 @@ mod tests {
                 total_tokens: 23,
             },
             Some("turn-1"),
+            &policy,
             &mut tokens,
             &mut rate_limit,
         )?;
@@ -625,13 +784,14 @@ mod tests {
     }
 
     #[test]
-    // SPEC 17.5: user input requests map to a specific runner-visible error.
     fn user_input_required_returns_specific_error() {
+        let policy = default_policy();
         let mut tokens = SessionTokens::default();
         let mut rate_limit = None;
         let result = evaluate_event(
             CodexEvent::UserInputRequired,
             Some("turn-1"),
+            &policy,
             &mut tokens,
             &mut rate_limit,
         );
@@ -644,8 +804,8 @@ mod tests {
     }
 
     #[test]
-    // SPEC 17.5: matching terminal turn events complete the current turn successfully.
     fn matching_terminal_event_completes_turn() -> Result<(), SymphonyError> {
+        let policy = default_policy();
         let mut tokens = SessionTokens::default();
         let mut rate_limit = None;
         let action = evaluate_event(
@@ -653,11 +813,404 @@ mod tests {
                 turn_id: "turn-1".into(),
             },
             Some("turn-1"),
+            &policy,
             &mut tokens,
             &mut rate_limit,
         )?;
 
         assert!(matches!(action, TurnAction::Complete(RunOutcome::Success)));
+
+        Ok(())
+    }
+
+    #[test]
+    fn tool_call_event_produces_execute_action() -> Result<(), SymphonyError> {
+        let policy = default_policy();
+        let mut tokens = SessionTokens::default();
+        let mut rate_limit = None;
+        let action = evaluate_event(
+            CodexEvent::ToolCall {
+                id: json!(15),
+                name: "linear_graphql".into(),
+                params: json!({"query": "query { viewer { id } }"}),
+            },
+            Some("turn-1"),
+            &policy,
+            &mut tokens,
+            &mut rate_limit,
+        )?;
+
+        assert!(matches!(
+            action,
+            TurnAction::ExecuteToolCall { name, .. } if name == "linear_graphql"
+        ));
+
+        Ok(())
+    }
+
+    #[test]
+    fn reject_policy_auto_approves_known_types() -> Result<(), SymphonyError> {
+        let policy = json!({
+            "reject": {
+                "sandbox_approval": true,
+                "rules": true,
+            }
+        });
+        let mut tokens = SessionTokens::default();
+        let mut rate_limit = None;
+        let action = evaluate_event(
+            CodexEvent::ApprovalRequest {
+                id: json!(20),
+                payload: json!({"kind": "sandbox_approval"}),
+            },
+            Some("turn-1"),
+            &policy,
+            &mut tokens,
+            &mut rate_limit,
+        )?;
+
+        assert!(matches!(action, TurnAction::AutoApprove(_)));
+
+        Ok(())
+    }
+
+    #[test]
+    fn reject_policy_rejects_unknown_approval_type() {
+        let policy = json!({
+            "reject": {
+                "sandbox_approval": true,
+            }
+        });
+        let mut tokens = SessionTokens::default();
+        let mut rate_limit = None;
+        let result = evaluate_event(
+            CodexEvent::ApprovalRequest {
+                id: json!(21),
+                payload: json!({"kind": "some_unknown_type"}),
+            },
+            Some("turn-1"),
+            &policy,
+            &mut tokens,
+            &mut rate_limit,
+        );
+
+        assert!(matches!(result, Err(SymphonyError::Codex(msg)) if msg.contains("approval_required")));
+    }
+
+    #[test]
+    fn auto_policy_approves_all() -> Result<(), SymphonyError> {
+        let policy = json!({ "autoApprove": ["command_execution"] });
+        let mut tokens = SessionTokens::default();
+        let mut rate_limit = None;
+        let action = evaluate_event(
+            CodexEvent::ApprovalRequest {
+                id: json!(22),
+                payload: json!({"kind": "anything"}),
+            },
+            Some("turn-1"),
+            &policy,
+            &mut tokens,
+            &mut rate_limit,
+        )?;
+
+        assert!(matches!(action, TurnAction::AutoApprove(_)));
+
+        Ok(())
+    }
+
+    #[test]
+    fn turn_failed_produces_failure_outcome() -> Result<(), SymphonyError> {
+        let policy = default_policy();
+        let mut tokens = SessionTokens::default();
+        let mut rate_limit = None;
+        let action = evaluate_event(
+            CodexEvent::TurnFailed {
+                turn_id: "turn-1".into(),
+                error: "catastrophe".into(),
+            },
+            Some("turn-1"),
+            &policy,
+            &mut tokens,
+            &mut rate_limit,
+        )?;
+
+        assert!(
+            matches!(action, TurnAction::Complete(RunOutcome::Failure(msg)) if msg == "catastrophe")
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn turn_cancelled_produces_failure_outcome() -> Result<(), SymphonyError> {
+        let policy = default_policy();
+        let mut tokens = SessionTokens::default();
+        let mut rate_limit = None;
+        let action = evaluate_event(
+            CodexEvent::TurnCancelled {
+                turn_id: "turn-1".into(),
+            },
+            Some("turn-1"),
+            &policy,
+            &mut tokens,
+            &mut rate_limit,
+        )?;
+
+        assert!(matches!(
+            action,
+            TurnAction::Complete(RunOutcome::Failure(msg)) if msg == "turn_cancelled"
+        ));
+
+        Ok(())
+    }
+
+    #[test]
+    fn mismatched_turn_id_continues() -> Result<(), SymphonyError> {
+        let policy = default_policy();
+        let mut tokens = SessionTokens::default();
+        let mut rate_limit = None;
+        let action = evaluate_event(
+            CodexEvent::TurnCompleted {
+                turn_id: "turn-OTHER".into(),
+            },
+            Some("turn-1"),
+            &policy,
+            &mut tokens,
+            &mut rate_limit,
+        )?;
+
+        assert!(matches!(action, TurnAction::Continue));
+
+        Ok(())
+    }
+
+    #[test]
+    fn empty_turn_id_matches_any_current() -> Result<(), SymphonyError> {
+        let policy = default_policy();
+        let mut tokens = SessionTokens::default();
+        let mut rate_limit = None;
+        let action = evaluate_event(
+            CodexEvent::TurnCompleted {
+                turn_id: String::new(),
+            },
+            Some("turn-1"),
+            &policy,
+            &mut tokens,
+            &mut rate_limit,
+        )?;
+
+        assert!(matches!(action, TurnAction::Complete(RunOutcome::Success)));
+
+        Ok(())
+    }
+
+    #[test]
+    fn no_current_turn_id_completes_on_any_event() -> Result<(), SymphonyError> {
+        let policy = default_policy();
+        let mut tokens = SessionTokens::default();
+        let mut rate_limit = None;
+        let action = evaluate_event(
+            CodexEvent::TurnCompleted {
+                turn_id: "turn-X".into(),
+            },
+            None,
+            &policy,
+            &mut tokens,
+            &mut rate_limit,
+        )?;
+
+        assert!(matches!(action, TurnAction::Complete(RunOutcome::Success)));
+
+        Ok(())
+    }
+
+    #[test]
+    fn rate_limit_event_stores_payload() -> Result<(), SymphonyError> {
+        let policy = default_policy();
+        let mut tokens = SessionTokens::default();
+        let mut rate_limit = None;
+        let action = evaluate_event(
+            CodexEvent::RateLimit {
+                payload: json!({"remaining": 10}),
+            },
+            Some("turn-1"),
+            &policy,
+            &mut tokens,
+            &mut rate_limit,
+        )?;
+
+        assert!(matches!(action, TurnAction::Continue));
+        assert_eq!(rate_limit, Some(json!({"remaining": 10})));
+
+        Ok(())
+    }
+
+    #[test]
+    fn unknown_event_continues() -> Result<(), SymphonyError> {
+        let policy = default_policy();
+        let mut tokens = SessionTokens::default();
+        let mut rate_limit = None;
+        let action = evaluate_event(
+            CodexEvent::Unknown(json!({"method": "something"})),
+            Some("turn-1"),
+            &policy,
+            &mut tokens,
+            &mut rate_limit,
+        )?;
+
+        assert!(matches!(action, TurnAction::Continue));
+
+        Ok(())
+    }
+
+    #[test]
+    fn tool_call_with_unknown_tool_produces_execute_action() -> Result<(), SymphonyError> {
+        let policy = default_policy();
+        let mut tokens = SessionTokens::default();
+        let mut rate_limit = None;
+        let action = evaluate_event(
+            CodexEvent::ToolCall {
+                id: json!(30),
+                name: "unknown_tool".into(),
+                params: json!({}),
+            },
+            Some("turn-1"),
+            &policy,
+            &mut tokens,
+            &mut rate_limit,
+        )?;
+
+        assert!(matches!(
+            action,
+            TurnAction::ExecuteToolCall { name, .. } if name == "unknown_tool"
+        ));
+
+        Ok(())
+    }
+
+    #[test]
+    fn reject_policy_auto_approves_default_known_actions() -> Result<(), SymphonyError> {
+        let policy = json!({ "reject": {} });
+        let mut tokens = SessionTokens::default();
+        let mut rate_limit = None;
+
+        for action_type in &[
+            "command_execution",
+            "file_changes",
+            "sandbox_approval",
+            "rules",
+            "mcp_elicitations",
+        ] {
+            let action = evaluate_event(
+                CodexEvent::ApprovalRequest {
+                    id: json!(40),
+                    payload: json!({"kind": action_type}),
+                },
+                Some("turn-1"),
+                &policy,
+                &mut tokens,
+                &mut rate_limit,
+            )?;
+
+            assert!(
+                matches!(action, TurnAction::AutoApprove(_)),
+                "expected auto-approve for {action_type}"
+            );
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn reject_policy_approves_explicitly_listed_type() -> Result<(), SymphonyError> {
+        let policy = json!({
+            "reject": {
+                "custom_action": true,
+            }
+        });
+        let mut tokens = SessionTokens::default();
+        let mut rate_limit = None;
+        let action = evaluate_event(
+            CodexEvent::ApprovalRequest {
+                id: json!(41),
+                payload: json!({"kind": "custom_action"}),
+            },
+            Some("turn-1"),
+            &policy,
+            &mut tokens,
+            &mut rate_limit,
+        )?;
+
+        assert!(matches!(action, TurnAction::AutoApprove(_)));
+
+        Ok(())
+    }
+
+    #[test]
+    fn no_policy_approves_all_requests() -> Result<(), SymphonyError> {
+        let policy = json!({});
+        let mut tokens = SessionTokens::default();
+        let mut rate_limit = None;
+        let action = evaluate_event(
+            CodexEvent::ApprovalRequest {
+                id: json!(42),
+                payload: json!({"kind": "anything_goes"}),
+            },
+            Some("turn-1"),
+            &policy,
+            &mut tokens,
+            &mut rate_limit,
+        )?;
+
+        assert!(matches!(action, TurnAction::AutoApprove(_)));
+
+        Ok(())
+    }
+
+    #[test]
+    fn unsupported_tool_result_mentions_supported_tools() {
+        let result = build_unsupported_tool_result("magic_tool");
+        let output_str = result["output"].as_str().unwrap();
+
+        assert!(output_str.contains("linear_graphql"));
+        assert!(output_str.contains("magic_tool"));
+    }
+
+    #[test]
+    fn session_tokens_update_from_thread_totals_tracks_delta() {
+        let mut tokens = SessionTokens::default();
+        tokens.update_from_thread_totals(10, 5, 15);
+
+        assert_eq!(tokens.input_tokens, 10);
+        assert_eq!(tokens.output_tokens, 5);
+        assert_eq!(tokens.total_tokens, 15);
+        assert_eq!(tokens.last_reported_total, 15);
+
+        tokens.update_from_thread_totals(20, 10, 30);
+
+        assert_eq!(tokens.input_tokens, 20);
+        assert_eq!(tokens.output_tokens, 10);
+        assert_eq!(tokens.total_tokens, 30);
+        assert_eq!(tokens.last_reported_total, 30);
+    }
+
+    #[test]
+    fn approval_request_with_type_field_extracts_correctly() -> Result<(), SymphonyError> {
+        let policy = json!({ "reject": { "sandbox_approval": true } });
+        let mut tokens = SessionTokens::default();
+        let mut rate_limit = None;
+        let action = evaluate_event(
+            CodexEvent::ApprovalRequest {
+                id: json!(50),
+                payload: json!({"type": "sandbox_approval"}),
+            },
+            Some("turn-1"),
+            &policy,
+            &mut tokens,
+            &mut rate_limit,
+        )?;
+
+        assert!(matches!(action, TurnAction::AutoApprove(_)));
 
         Ok(())
     }

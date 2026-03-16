@@ -71,6 +71,7 @@ pub struct LiveSession {
     pub issue_id: String,
     pub issue_identifier: String,
     pub issue_state: String,
+    pub worker_host: Option<String>,
     pub workspace_path: String,
     pub started_at: DateTime<Utc>,
     pub turn_count: u32,
@@ -85,6 +86,7 @@ pub struct RetryEntry {
     pub attempt: u32,
     pub scheduled_at: DateTime<Utc>,
     pub reason: Option<String>,
+    pub worker_host: Option<String>,
 }
 
 #[cfg(test)]

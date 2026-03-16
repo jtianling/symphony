@@ -53,6 +53,7 @@ pub struct LinearIssue {
     #[serde(rename = "updatedAt")]
     pub updated_at: Option<String>,
     pub state: Option<StateNode>,
+    pub assignee: Option<AssigneeNode>,
     pub labels: Option<LabelsConnection>,
     #[serde(rename = "inverseRelations")]
     pub inverse_relations: Option<InverseRelationsConnection>,
@@ -61,6 +62,11 @@ pub struct LinearIssue {
 #[derive(Debug, Clone, Deserialize)]
 pub struct StateNode {
     pub name: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct AssigneeNode {
+    pub id: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -92,4 +98,57 @@ pub struct RelatedIssue {
     pub id: String,
     pub identifier: String,
     pub state: Option<StateNode>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CommentCreateData {
+    #[serde(rename = "commentCreate")]
+    pub comment_create: MutationResult,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct IssueUpdateData {
+    #[serde(rename = "issueUpdate")]
+    pub issue_update: MutationResult,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct MutationResult {
+    pub success: bool,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct StateLookupData {
+    pub issue: Option<StateLookupIssue>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct StateLookupIssue {
+    pub team: Option<StateLookupTeam>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct StateLookupTeam {
+    pub states: StateLookupConnection,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct StateLookupConnection {
+    #[serde(default)]
+    pub nodes: Vec<StateLookupNode>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct StateLookupNode {
+    pub id: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ViewerData {
+    pub viewer: Option<ViewerNode>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ViewerNode {
+    pub id: String,
 }

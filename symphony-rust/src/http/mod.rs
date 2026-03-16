@@ -5,6 +5,7 @@ mod server;
 use std::sync::{Arc, RwLock};
 
 use chrono::Utc;
+use tokio::sync::{broadcast, watch};
 use tracing::warn;
 
 use crate::orchestrator::{AggregateTokens, SnapshotCounts, StateSnapshot};
@@ -15,16 +16,25 @@ pub use server::HttpServer;
 
 pub struct StateProvider {
     state: Arc<RwLock<StateSnapshot>>,
+    watch_tx: watch::Sender<()>,
+    broadcast_tx: broadcast::Sender<StateSnapshot>,
 }
 
 impl StateProvider {
     pub fn new() -> Self {
+        let (watch_tx, _) = watch::channel(());
+        let (broadcast_tx, _) = broadcast::channel(32);
+
         Self {
             state: Arc::new(RwLock::new(empty_snapshot())),
+            watch_tx,
+            broadcast_tx,
         }
     }
 
     pub fn update(&self, snapshot: StateSnapshot) {
+        let event_snapshot = snapshot.clone();
+
         match self.state.write() {
             Ok(mut guard) => {
                 *guard = snapshot;
@@ -34,6 +44,9 @@ impl StateProvider {
                 *error.into_inner() = snapshot;
             }
         }
+
+        self.watch_tx.send_replace(());
+        let _ = self.broadcast_tx.send(event_snapshot);
     }
 
     pub fn snapshot(&self) -> StateSnapshot {
@@ -44,6 +57,14 @@ impl StateProvider {
                 error.into_inner().clone()
             }
         }
+    }
+
+    pub fn subscribe(&self) -> watch::Receiver<()> {
+        self.watch_tx.subscribe()
+    }
+
+    pub fn subscribe_events(&self) -> broadcast::Receiver<StateSnapshot> {
+        self.broadcast_tx.subscribe()
     }
 }
 

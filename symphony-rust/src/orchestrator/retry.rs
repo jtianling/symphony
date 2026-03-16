@@ -151,4 +151,100 @@ mod tests {
 
         assert_eq!(delay, Duration::from_millis(30_000));
     }
+
+    #[test]
+    fn compute_retry_delay_first_failure_uses_base() {
+        let delay = compute_retry_delay(&WorkerOutcome::Failure("error".into()), 1, 300_000);
+
+        assert_eq!(delay, Duration::from_millis(10_000));
+    }
+
+    #[test]
+    fn compute_retry_delay_second_failure_doubles() {
+        let delay = compute_retry_delay(&WorkerOutcome::Failure("error".into()), 2, 300_000);
+
+        assert_eq!(delay, Duration::from_millis(20_000));
+    }
+
+    #[test]
+    fn compute_retry_delay_large_attempt_caps_at_max() {
+        let delay = compute_retry_delay(&WorkerOutcome::Failure("error".into()), 100, 300_000);
+
+        assert_eq!(delay, Duration::from_millis(300_000));
+    }
+
+    #[test]
+    fn compute_retry_delay_normal_ignores_attempt() {
+        let delay = compute_retry_delay(&WorkerOutcome::Normal, 1, 300_000);
+        assert_eq!(delay, Duration::from_millis(1_000));
+
+        let delay = compute_retry_delay(&WorkerOutcome::Normal, 100, 300_000);
+        assert_eq!(delay, Duration::from_millis(1_000));
+    }
+
+    #[tokio::test]
+    async fn retry_queue_schedule_and_cancel() {
+        let mut queue = super::RetryQueue::default();
+        let (msg_tx, _msg_rx) = tokio::sync::mpsc::channel(8);
+
+        queue.schedule("issue-1", 1, Duration::from_secs(60), msg_tx.clone());
+        assert!(queue.contains("issue-1"));
+        assert_eq!(queue.len(), 1);
+        assert_eq!(queue.attempt("issue-1"), Some(1));
+
+        queue.cancel("issue-1");
+        assert!(!queue.contains("issue-1"));
+        assert_eq!(queue.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn retry_queue_remove_returns_attempt_info() {
+        let mut queue = super::RetryQueue::default();
+        let (msg_tx, _msg_rx) = tokio::sync::mpsc::channel(8);
+
+        queue.schedule("issue-1", 3, Duration::from_secs(60), msg_tx);
+        let result = queue.remove("issue-1");
+
+        assert!(result.is_some());
+        let (attempt, _fire_at) = result.unwrap();
+        assert_eq!(attempt, 3);
+        assert!(!queue.contains("issue-1"));
+    }
+
+    #[tokio::test]
+    async fn retry_queue_clear_removes_all() {
+        let mut queue = super::RetryQueue::default();
+        let (msg_tx, _msg_rx) = tokio::sync::mpsc::channel(8);
+
+        queue.schedule("issue-1", 1, Duration::from_secs(60), msg_tx.clone());
+        queue.schedule("issue-2", 2, Duration::from_secs(60), msg_tx);
+        assert_eq!(queue.len(), 2);
+
+        queue.clear();
+        assert!(queue.is_empty());
+    }
+
+    #[tokio::test]
+    async fn retry_queue_schedule_replaces_existing() {
+        let mut queue = super::RetryQueue::default();
+        let (msg_tx, _msg_rx) = tokio::sync::mpsc::channel(8);
+
+        queue.schedule("issue-1", 1, Duration::from_secs(60), msg_tx.clone());
+        queue.schedule("issue-1", 5, Duration::from_secs(30), msg_tx);
+
+        assert_eq!(queue.len(), 1);
+        assert_eq!(queue.attempt("issue-1"), Some(5));
+    }
+
+    #[tokio::test]
+    async fn retry_queue_fire_at_returns_scheduled_time() {
+        let mut queue = super::RetryQueue::default();
+        let (msg_tx, _msg_rx) = tokio::sync::mpsc::channel(8);
+
+        queue.schedule("issue-1", 1, Duration::from_secs(60), msg_tx);
+        let fire_at = queue.fire_at("issue-1");
+
+        assert!(fire_at.is_some());
+        assert!(fire_at.unwrap() > std::time::Instant::now());
+    }
 }

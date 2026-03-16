@@ -47,6 +47,7 @@ pub struct RunningSnapshot {
     pub issue_id: String,
     pub issue_identifier: String,
     pub state: String,
+    pub worker_host: Option<String>,
     pub session_id: String,
     pub turn_count: u32,
     pub workspace_path: String,
@@ -85,6 +86,13 @@ impl OrchestratorState {
         self.running
             .values()
             .filter(|session| normalize_state(&session.issue_state) == normalized)
+            .count()
+    }
+
+    pub fn running_count_by_host(&self, host: &str) -> usize {
+        self.running
+            .values()
+            .filter(|session| session.worker_host.as_deref() == Some(host))
             .count()
     }
 
@@ -206,6 +214,7 @@ impl OrchestratorState {
                 issue_id: session.issue_id,
                 issue_identifier: session.issue_identifier,
                 state: session.issue_state,
+                worker_host: session.worker_host,
                 session_id: session.session_id,
                 turn_count: session.turn_count,
                 workspace_path: session.workspace_path,
@@ -252,6 +261,7 @@ mod tests {
             issue_id: issue_id.into(),
             issue_identifier: format!("SYM-{issue_id}"),
             issue_state: issue_state.into(),
+            worker_host: None,
             workspace_path: format!("/tmp/{issue_id}"),
             started_at: Utc::now() - Duration::seconds(5),
             turn_count: 1,
@@ -303,6 +313,36 @@ mod tests {
     }
 
     #[test]
+    fn running_count_by_host_returns_zero_when_no_sessions_exist() {
+        let state = OrchestratorState::default();
+
+        assert_eq!(state.running_count_by_host("host1"), 0);
+    }
+
+    #[test]
+    fn running_count_by_host_counts_only_remote_sessions_for_host() {
+        let mut state = OrchestratorState::default();
+        let mut local = sample_session("issue-1", "Todo");
+        let mut host1_a = sample_session("issue-2", "Todo");
+        let mut host1_b = sample_session("issue-3", "In Progress");
+        let mut host2 = sample_session("issue-4", "Todo");
+
+        local.worker_host = None;
+        host1_a.worker_host = Some(String::from("host1"));
+        host1_b.worker_host = Some(String::from("host1"));
+        host2.worker_host = Some(String::from("host2"));
+
+        state.add_running(local);
+        state.add_running(host1_a);
+        state.add_running(host1_b);
+        state.add_running(host2);
+
+        assert_eq!(state.running_count_by_host("host1"), 2);
+        assert_eq!(state.running_count_by_host("host2"), 1);
+        assert_eq!(state.running_count_by_host("host3"), 0);
+    }
+
+    #[test]
     // SPEC 17.6: snapshot output includes aggregate runtime seconds for active sessions.
     fn snapshot_includes_active_runtime_seconds() {
         let mut state = OrchestratorState::default();
@@ -313,6 +353,7 @@ mod tests {
 
         assert_eq!(snapshot.counts.running, 1);
         assert!(snapshot.codex_totals.seconds_running >= 15.0);
+        assert_eq!(snapshot.running[0].worker_host, None);
     }
 
     #[test]
@@ -327,6 +368,7 @@ mod tests {
             attempt: 2,
             scheduled_at: Utc::now() + Duration::seconds(30),
             reason: Some("retry".into()),
+            worker_host: None,
         });
 
         let snapshot = state.snapshot();
@@ -334,5 +376,225 @@ mod tests {
         assert_eq!(snapshot.counts.retrying, 1);
         assert_eq!(snapshot.retrying.len(), 1);
         assert_eq!(snapshot.retrying[0].issue_identifier, "SYM-1");
+    }
+
+    #[test]
+    fn add_session_tokens_accumulates_correctly() {
+        let mut state = OrchestratorState::default();
+        state.add_running(sample_session("issue-1", "Todo"));
+
+        let tokens = TokenUsage {
+            input_tokens: 10,
+            output_tokens: 20,
+            total_tokens: 30,
+        };
+        state.add_session_tokens("issue-1", &tokens);
+        state.add_session_tokens("issue-1", &tokens);
+
+        let session = state.running.get("issue-1").unwrap();
+        assert_eq!(session.tokens.input_tokens, 21);
+        assert_eq!(session.tokens.output_tokens, 42);
+        assert_eq!(session.tokens.total_tokens, 63);
+    }
+
+    #[test]
+    fn add_aggregate_tokens_accumulates_globally() {
+        let mut state = OrchestratorState::default();
+
+        let tokens = TokenUsage {
+            input_tokens: 100,
+            output_tokens: 200,
+            total_tokens: 300,
+        };
+        state.add_aggregate_tokens(&tokens);
+        state.add_aggregate_tokens(&tokens);
+
+        assert_eq!(state.codex_totals.input_tokens, 200);
+        assert_eq!(state.codex_totals.output_tokens, 400);
+        assert_eq!(state.codex_totals.total_tokens, 600);
+    }
+
+    #[test]
+    fn update_session_state_updates_issue_state() {
+        let mut state = OrchestratorState::default();
+        state.add_running(sample_session("issue-1", "Todo"));
+
+        state.update_session_state("issue-1", "In Progress");
+
+        let session = state.running.get("issue-1").unwrap();
+        assert_eq!(session.issue_state, "In Progress");
+    }
+
+    #[test]
+    fn update_session_state_ignores_unknown_issue() {
+        let mut state = OrchestratorState::default();
+
+        state.update_session_state("nonexistent", "Done");
+    }
+
+    #[test]
+    fn update_session_started_sets_session_id() {
+        let mut state = OrchestratorState::default();
+        state.add_running(sample_session("issue-1", "Todo"));
+
+        state.update_session_started("issue-1", "new-session-id");
+
+        let session = state.running.get("issue-1").unwrap();
+        assert_eq!(session.session_id, "new-session-id");
+    }
+
+    #[test]
+    fn increment_turn_count_increments_by_one() {
+        let mut state = OrchestratorState::default();
+        state.add_running(sample_session("issue-1", "Todo"));
+
+        state.increment_turn_count("issue-1");
+        state.increment_turn_count("issue-1");
+
+        let session = state.running.get("issue-1").unwrap();
+        assert_eq!(session.turn_count, 3);
+    }
+
+    #[test]
+    fn update_session_timestamp_stores_new_timestamp() {
+        let mut state = OrchestratorState::default();
+        state.add_running(sample_session("issue-1", "Todo"));
+
+        let timestamp = Utc::now();
+        state.update_session_timestamp("issue-1", timestamp);
+
+        let session = state.running.get("issue-1").unwrap();
+        assert_eq!(session.last_codex_timestamp, Some(timestamp));
+    }
+
+    #[test]
+    fn set_rate_limits_stores_and_overwrites() {
+        let mut state = OrchestratorState::default();
+
+        state.set_rate_limits(Some(serde_json::json!({"remaining": 10})));
+        assert!(state.codex_rate_limits.is_some());
+
+        state.set_rate_limits(None);
+        assert!(state.codex_rate_limits.is_none());
+    }
+
+    #[test]
+    fn retry_attempt_returns_zero_for_unknown_issue() {
+        let state = OrchestratorState::default();
+        assert_eq!(state.retry_attempt("nonexistent"), 0);
+    }
+
+    #[test]
+    fn clear_retry_attempt_removes_both_attempt_and_entry() {
+        let mut state = OrchestratorState::default();
+        state.set_retry_attempt("issue-1", 3);
+        state.set_retry_entry(RetryEntry {
+            issue_id: "issue-1".into(),
+            issue_identifier: "SYM-1".into(),
+            attempt: 3,
+            scheduled_at: Utc::now(),
+            reason: None,
+            worker_host: None,
+        });
+
+        state.clear_retry_attempt("issue-1");
+
+        assert_eq!(state.retry_attempt("issue-1"), 0);
+        assert!(state.retry_entry("issue-1").is_none());
+    }
+
+    #[test]
+    fn clear_retry_entry_only_removes_entry() {
+        let mut state = OrchestratorState::default();
+        state.set_retry_attempt("issue-1", 3);
+        state.set_retry_entry(RetryEntry {
+            issue_id: "issue-1".into(),
+            issue_identifier: "SYM-1".into(),
+            attempt: 3,
+            scheduled_at: Utc::now(),
+            reason: None,
+            worker_host: None,
+        });
+
+        state.clear_retry_entry("issue-1");
+
+        assert_eq!(state.retry_attempt("issue-1"), 3);
+        assert!(state.retry_entry("issue-1").is_none());
+    }
+
+    #[test]
+    fn mark_completed_tracks_issue() {
+        let mut state = OrchestratorState::default();
+
+        state.mark_completed("issue-1");
+
+        assert!(state.completed.contains("issue-1"));
+        let snapshot = state.snapshot();
+        assert_eq!(snapshot.counts.completed, 1);
+    }
+
+    #[test]
+    fn snapshot_running_sorted_by_identifier() {
+        let mut state = OrchestratorState::default();
+        let mut session_b = sample_session("b", "Todo");
+        session_b.issue_identifier = "SYM-B".into();
+        let mut session_a = sample_session("a", "Todo");
+        session_a.issue_identifier = "SYM-A".into();
+
+        state.add_running(session_b);
+        state.add_running(session_a);
+
+        let snapshot = state.snapshot();
+        assert_eq!(snapshot.running[0].issue_identifier, "SYM-A");
+        assert_eq!(snapshot.running[1].issue_identifier, "SYM-B");
+    }
+
+    #[test]
+    fn snapshot_retrying_sorted_by_identifier() {
+        let mut state = OrchestratorState::default();
+        state.set_retry_entry(RetryEntry {
+            issue_id: "b".into(),
+            issue_identifier: "SYM-B".into(),
+            attempt: 1,
+            scheduled_at: Utc::now(),
+            reason: None,
+            worker_host: None,
+        });
+        state.set_retry_entry(RetryEntry {
+            issue_id: "a".into(),
+            issue_identifier: "SYM-A".into(),
+            attempt: 1,
+            scheduled_at: Utc::now(),
+            reason: None,
+            worker_host: None,
+        });
+
+        let snapshot = state.snapshot();
+        assert_eq!(snapshot.retrying[0].issue_identifier, "SYM-A");
+        assert_eq!(snapshot.retrying[1].issue_identifier, "SYM-B");
+    }
+
+    #[test]
+    fn add_runtime_from_session_adds_positive_seconds() {
+        let mut state = OrchestratorState::default();
+
+        let session = sample_session("issue-1", "Todo");
+        state.add_runtime_from_session(&session);
+
+        assert!(state.codex_totals.seconds_running >= 5.0);
+    }
+
+    #[test]
+    fn snapshot_counts_match_state() {
+        let mut state = OrchestratorState::default();
+        state.add_running(sample_session("issue-1", "Todo"));
+        state.claim_issue("issue-1");
+        state.claim_issue("issue-2");
+        state.mark_completed("issue-3");
+
+        let snapshot = state.snapshot();
+        assert_eq!(snapshot.counts.running, 1);
+        assert_eq!(snapshot.counts.claimed, 2);
+        assert_eq!(snapshot.counts.completed, 1);
     }
 }

@@ -28,6 +28,8 @@ pub enum SymphonyError {
     Tracker(String),
     #[error("workspace error: {0}")]
     Workspace(String),
+    #[error("ssh error: {0}")]
+    Ssh(String),
     #[error("prompt error: {0}")]
     Prompt(String),
     #[error("prompt render error: {0}")]

@@ -26,11 +26,15 @@
 pub mod agent_runner;
 pub mod codex;
 pub mod config;
+pub mod dashboard;
 pub mod domain;
 pub mod error;
 pub mod http;
 pub mod linear;
+pub mod logging;
 pub mod orchestrator;
 pub mod prompt;
+pub mod ssh;
+pub mod tracker;
 pub mod workflow;
 pub mod workspace;

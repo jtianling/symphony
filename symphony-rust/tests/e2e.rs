@@ -17,11 +17,14 @@ use wiremock::matchers::{body_partial_json, header, method};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use symphony::config::SymphonyConfig;
+use symphony::logging::resolve_log_file_path;
 use symphony::workflow::load_workflow;
 
 const ELIXIR_WORKFLOW_PATH: &str = "/Users/jtianling/workspace/symphony/elixir/WORKFLOW.md";
 const WAIT_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const WAIT_TIMEOUT: Duration = Duration::from_secs(30);
+const GUARDRAILS_ACKNOWLEDGEMENT_FLAG: &str =
+    "--i-understand-that-this-will-be-running-without-the-usual-guardrails";
 
 #[test]
 // SPEC 17.1: a realistic repository `WORKFLOW.md` example parses end-to-end.
@@ -104,6 +107,27 @@ async fn binary_smoke_test_uses_mock_linear_and_mock_codex(
         .mount(&linear_server)
         .await;
 
+    Mock::given(method("POST"))
+        .and(header("authorization", "linear-test-key"))
+        .and(body_partial_json(json!({
+            "variables": {
+                "ids": ["issue-1"]
+            }
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": {
+                "nodes": [
+                    {
+                        "id": "issue-1",
+                        "identifier": "SYM-1",
+                        "state": { "name": "Todo" }
+                    }
+                ]
+            }
+        })))
+        .mount(&linear_server)
+        .await;
+
     let directory = tempdir()?;
     let workflow_path = directory.path().join("WORKFLOW.md");
     let codex_script_path = directory.path().join("mock-codex.sh");
@@ -133,6 +157,40 @@ async fn binary_smoke_test_uses_mock_linear_and_mock_codex(
 
     let received_requests = linear_server.received_requests().await.unwrap_or_default();
     assert!(!received_requests.is_empty());
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn binary_creates_log_file_at_default_path() -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempdir()?;
+    let workflow_path = directory.path().join("WORKFLOW.md");
+    fs::write(&workflow_path, memory_workflow())?;
+
+    let child = spawn_symphony_in_dir(&workflow_path, &[], directory.path())?;
+    let expected_log_path = directory.path().join("log").join("symphony.log");
+    wait_for_file(&expected_log_path).await?;
+    terminate_child(child).await?;
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn binary_logs_root_flag_overrides_default_directory(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempdir()?;
+    let workflow_path = directory.path().join("WORKFLOW.md");
+    let logs_root = directory.path().join("custom-logs-root");
+    fs::write(&workflow_path, memory_workflow())?;
+
+    let child = spawn_symphony_in_dir(
+        &workflow_path,
+        &["--logs-root", logs_root.to_str().unwrap()],
+        directory.path(),
+    )?;
+    let expected_log_path = resolve_log_file_path(Some(logs_root.to_str().unwrap()))?;
+    wait_for_file(&expected_log_path).await?;
+    terminate_child(child).await?;
 
     Ok(())
 }
@@ -217,6 +275,26 @@ Issue {{{{ issue.identifier }}}}
     )
 }
 
+fn memory_workflow() -> &'static str {
+    r#"---
+tracker:
+  kind: memory
+polling:
+  interval_ms: 60000
+agent:
+  max_concurrent_agents: 1
+  max_turns: 1
+codex:
+  command: "codex app-server"
+  approval_policy: never
+observability:
+  dashboard_enabled: false
+---
+
+Issue {{{{ issue.identifier }}}}
+"#
+}
+
 fn write_mock_codex_script(
     script_path: &Path,
     spawn_marker: &Path,
@@ -268,9 +346,22 @@ done
 }
 
 fn spawn_symphony(workflow_path: &Path) -> Result<Child, Box<dyn std::error::Error>> {
+    let current_dir = std::env::current_dir()?;
+
+    spawn_symphony_in_dir(workflow_path, &[], &current_dir)
+}
+
+fn spawn_symphony_in_dir(
+    workflow_path: &Path,
+    extra_args: &[&str],
+    current_dir: &Path,
+) -> Result<Child, Box<dyn std::error::Error>> {
     let mut command = Command::new(env!("CARGO_BIN_EXE_symphony"));
     command
+        .arg(GUARDRAILS_ACKNOWLEDGEMENT_FLAG)
         .arg(workflow_path)
+        .args(extra_args)
+        .current_dir(current_dir)
         .env("RUST_LOG", "warn")
         .stdout(Stdio::null())
         .stderr(Stdio::piped());

@@ -2039,9 +2039,11 @@ dependencies = [
  "tempfile",
  "thiserror",
  "tokio",
+ "tokio-stream",
  "tokio-test",
  "tower",
  "tracing",
+ "tracing-appender",
  "tracing-subscriber",
  "uuid",
  "wiremock",
@@ -2260,6 +2262,7 @@ dependencies = [
  "futures-core",
  "pin-project-lite",
  "tokio",
+ "tokio-util",
 ]
 
 [[package]]
@@ -2343,6 +2346,10 @@ dependencies = [
  "tracing-attributes",
  "tracing-core",
 ]
+
+[[package]]
+name = "tracing-appender"
+version = "0.0.0"
 
 [[package]]
 name = "tracing-attributes"

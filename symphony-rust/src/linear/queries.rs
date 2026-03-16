@@ -20,6 +20,7 @@ query($projectSlug: String!, $states: [String!]!, $after: String) {
       createdAt
       updatedAt
       state { name }
+      assignee { id }
       labels { nodes { name } }
       inverseRelations(first: 50) {
         nodes {
@@ -36,6 +37,14 @@ query($projectSlug: String!, $states: [String!]!, $after: String) {
       hasNextPage
       endCursor
     }
+  }
+}
+"#;
+
+pub const VIEWER_QUERY: &str = r#"
+query SymphonyViewer {
+  viewer {
+    id
   }
 }
 "#;
@@ -70,6 +79,36 @@ query($projectSlug: String!, $states: [String!]!, $after: String) {
     pageInfo {
       hasNextPage
       endCursor
+    }
+  }
+}
+"#;
+
+pub const CREATE_COMMENT_MUTATION: &str = r#"
+mutation SymphonyCreateComment($issueId: String!, $body: String!) {
+  commentCreate(input: {issueId: $issueId, body: $body}) {
+    success
+  }
+}
+"#;
+
+pub const UPDATE_STATE_MUTATION: &str = r#"
+mutation SymphonyUpdateIssueState($issueId: String!, $stateId: String!) {
+  issueUpdate(id: $issueId, input: {stateId: $stateId}) {
+    success
+  }
+}
+"#;
+
+pub const STATE_LOOKUP_QUERY: &str = r#"
+query SymphonyResolveStateId($issueId: String!, $stateName: String!) {
+  issue(id: $issueId) {
+    team {
+      states(filter: {name: {eq: $stateName}}, first: 1) {
+        nodes {
+          id
+        }
+      }
     }
   }
 }

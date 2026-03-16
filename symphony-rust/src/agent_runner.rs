@@ -2,19 +2,20 @@ use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
 use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 
+use crate::codex::tools::LinearGraphqlTool;
 use crate::codex::{AppServer, SessionTokens};
 use crate::config::{AgentConfig, CodexConfig};
 use crate::domain::{Issue, RunOutcome, TokenUsage};
 use crate::error::SymphonyError;
-use crate::linear::client::LinearClient;
 use crate::prompt::PromptBuilder;
+use crate::tracker::Tracker;
 use crate::workspace::{HookPhase, WorkspaceInfo, WorkspaceManager};
 
 const DEFAULT_CODEX_COMMAND: &str = "codex app-server";
-const DEFAULT_APPROVAL_POLICY: &str = "auto";
 const DEFAULT_SANDBOX: &str = "workspace-write";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -58,9 +59,11 @@ pub async fn run_worker(
     codex_config: CodexConfig,
     prompt_template: String,
     update_tx: mpsc::Sender<WorkerUpdate>,
-    tracker_client: Arc<LinearClient>,
+    tracker: Arc<dyn Tracker + Send + Sync>,
     active_states: Vec<String>,
     attempt: Option<u32>,
+    worker_host: Option<String>,
+    tool_executor: Option<Arc<LinearGraphqlTool>>,
 ) -> WorkerResult {
     let issue_id = issue.id.clone();
     let issue_identifier = issue.identifier.clone();
@@ -76,9 +79,11 @@ pub async fn run_worker(
         &codex_config,
         &prompt_template,
         &update_tx,
-        tracker_client.as_ref(),
+        tracker.as_ref(),
         &active_states,
         attempt,
+        worker_host.as_deref(),
+        tool_executor,
         &mut total_tokens,
         &mut workspace,
         &mut app_server,
@@ -102,6 +107,7 @@ pub async fn run_worker(
         workspace.as_ref(),
         app_server.as_mut(),
         &issue,
+        worker_host.as_deref(),
     )
     .await;
 
@@ -121,15 +127,17 @@ async fn prepare_worker(
     codex_config: &CodexConfig,
     prompt_template: &str,
     update_tx: &mpsc::Sender<WorkerUpdate>,
-    tracker_client: &LinearClient,
+    tracker: &(dyn Tracker + Send + Sync),
     active_states: &[String],
     attempt: Option<u32>,
+    worker_host: Option<&str>,
+    tool_executor: Option<Arc<LinearGraphqlTool>>,
     total_tokens: &mut TokenUsage,
     workspace: &mut Option<WorkspaceInfo>,
     app_server: &mut Option<AppServer>,
 ) -> Result<(), SymphonyError> {
     let workspace_info = workspace_manager
-        .ensure_workspace(&issue.identifier)
+        .ensure_workspace(&issue.identifier, worker_host)
         .await?;
     info!(
         issue_id = %issue.id,
@@ -141,17 +149,20 @@ async fn prepare_worker(
     *workspace = Some(workspace_info.clone());
 
     workspace_manager
-        .run_lifecycle_hooks(&workspace_info, HookPhase::AfterCreate)
+        .run_lifecycle_hooks(&workspace_info, HookPhase::AfterCreate, worker_host)
         .await?;
     workspace_manager
-        .run_lifecycle_hooks(&workspace_info, HookPhase::BeforeRun)
+        .run_lifecycle_hooks(&workspace_info, HookPhase::BeforeRun, worker_host)
         .await?;
 
     let first_prompt = prompt_builder.build_prompt(prompt_template, issue, attempt, 1)?;
     let cwd = workspace_info.path.to_string_lossy().into_owned();
     let command = codex_command(codex_config);
-    let approval_policy = codex_approval_policy(codex_config);
-    let sandbox = codex_sandbox(codex_config);
+    let approval_policy = codex_approval_policy(codex_config.approval_policy.as_ref());
+    let sandbox = codex_thread_sandbox(codex_config);
+    let turn_sandbox_policy = codex_turn_sandbox_policy(codex_config, &cwd);
+    let read_timeout_ms = codex_config.read_timeout_ms.unwrap_or(0);
+    let turn_timeout_ms = codex_config.turn_timeout_ms.unwrap_or(0);
 
     info!(
         issue_id = %issue.id,
@@ -159,7 +170,18 @@ async fn prepare_worker(
         command = %command,
         "launching codex app server"
     );
-    *app_server = Some(AppServer::launch(&command, &workspace_info.path, 0, 0).await?);
+    let mut server = AppServer::launch(
+        &command,
+        &workspace_info.path,
+        worker_host,
+        read_timeout_ms,
+        turn_timeout_ms,
+    )
+    .await?;
+    if let Some(tool) = tool_executor {
+        server.set_tool_executor(tool);
+    }
+    *app_server = Some(server);
     let session_id = {
         let server = app_server
             .as_mut()
@@ -212,7 +234,9 @@ async fn prepare_worker(
             let server = app_server
                 .as_mut()
                 .ok_or_else(|| SymphonyError::Codex("missing_app_server".into()))?;
-            server.start_turn(&thread_id, &prompt, &cwd).await?;
+            server
+                .start_turn(&thread_id, &prompt, &cwd, &turn_sandbox_policy)
+                .await?;
         }
         let turn_result = {
             let server = app_server
@@ -265,7 +289,7 @@ async fn prepare_worker(
             break;
         }
 
-        if !issue_is_active(tracker_client, issue, active_states).await {
+        if !issue_is_active(tracker, issue, active_states).await {
             info!(
                 issue_id = %issue.id,
                 issue_identifier = %issue.identifier,
@@ -284,6 +308,7 @@ async fn cleanup_worker(
     workspace: Option<&WorkspaceInfo>,
     app_server: Option<&mut AppServer>,
     issue: &Issue,
+    worker_host: Option<&str>,
 ) {
     if let Some(server) = app_server {
         match server.shutdown().await {
@@ -307,7 +332,7 @@ async fn cleanup_worker(
 
     if let Some(workspace) = workspace {
         if let Err(error) = workspace_manager
-            .run_lifecycle_hooks(workspace, HookPhase::AfterRun)
+            .run_lifecycle_hooks(workspace, HookPhase::AfterRun, worker_host)
             .await
         {
             warn!(
@@ -327,11 +352,11 @@ async fn send_update(update_tx: &mpsc::Sender<WorkerUpdate>, update: WorkerUpdat
 }
 
 async fn issue_is_active(
-    tracker_client: &LinearClient,
+    tracker: &(dyn Tracker + Send + Sync),
     issue: &Issue,
     active_states: &[String],
 ) -> bool {
-    match tracker_client
+    match tracker
         .refresh_issue_states(std::slice::from_ref(&issue.id))
         .await
     {
@@ -409,24 +434,59 @@ fn codex_command(config: &CodexConfig) -> String {
         .to_owned()
 }
 
-fn codex_approval_policy(config: &CodexConfig) -> String {
+fn default_approval_policy() -> Value {
+    json!({ "autoApprove": ["command_execution", "file_changes"] })
+}
+
+fn codex_approval_policy(approval_policy: Option<&Value>) -> Value {
+    match approval_policy {
+        None => default_approval_policy(),
+        Some(Value::String(policy)) if policy.trim().is_empty() || policy.trim() == "auto" => {
+            default_approval_policy()
+        }
+        Some(policy) => policy.clone(),
+    }
+}
+
+fn codex_thread_sandbox(config: &CodexConfig) -> String {
     config
-        .approval_policy
+        .thread_sandbox
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty())
-        .unwrap_or(DEFAULT_APPROVAL_POLICY)
+        .or_else(|| {
+            config
+                .sandbox
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+        })
+        .unwrap_or(DEFAULT_SANDBOX)
         .to_owned()
 }
 
-fn codex_sandbox(config: &CodexConfig) -> String {
+fn codex_turn_sandbox_policy(config: &CodexConfig, workspace_cwd: &str) -> Value {
     config
-        .sandbox
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .unwrap_or(DEFAULT_SANDBOX)
-        .to_owned()
+        .turn_sandbox_policy
+        .clone()
+        .unwrap_or_else(|| generate_turn_sandbox_policy(config, workspace_cwd))
+}
+
+fn generate_turn_sandbox_policy(config: &CodexConfig, workspace_cwd: &str) -> Value {
+    let sandbox = codex_thread_sandbox(config);
+    match sandbox.as_str() {
+        "workspace-write" => {
+            json!({
+                "type": "workspaceWrite",
+                "writableRoots": [workspace_cwd],
+                "readOnlyAccess": {"type": "fullAccess"},
+                "networkAccess": false,
+                "excludeTmpdirEnvVar": false,
+                "excludeSlashTmp": false,
+            })
+        }
+        _ => Value::String(sandbox),
+    }
 }
 
 #[cfg(test)]
@@ -434,7 +494,11 @@ mod tests {
     use chrono::TimeZone;
     use serde_json::json;
 
-    use super::{WorkerOutcome, WorkerResult, WorkerUpdate};
+    use super::{
+        codex_approval_policy, codex_thread_sandbox, codex_turn_sandbox_policy, WorkerOutcome,
+        WorkerResult, WorkerUpdate,
+    };
+    use crate::config::CodexConfig;
     use crate::domain::{RunOutcome, TokenUsage};
 
     #[test]
@@ -518,5 +582,328 @@ mod tests {
                 outcome: RunOutcome::Timeout,
             } if issue_id == "issue-2"
         ));
+    }
+
+    #[test]
+    fn codex_approval_policy_uses_default_for_auto() {
+        assert_eq!(
+            codex_approval_policy(Some(&json!("auto"))),
+            json!({ "autoApprove": ["command_execution", "file_changes"] })
+        );
+        assert_eq!(
+            codex_approval_policy(None),
+            json!({ "autoApprove": ["command_execution", "file_changes"] })
+        );
+    }
+
+    #[test]
+    fn codex_approval_policy_preserves_map_values() {
+        let policy = json!({ "reject": { "sandbox_approval": true } });
+
+        assert_eq!(codex_approval_policy(Some(&policy)), policy);
+    }
+
+    #[test]
+    fn config_thread_sandbox_with_sandbox_fallback() {
+        let config = CodexConfig {
+            sandbox: Some("container".into()),
+            ..CodexConfig::default()
+        };
+
+        assert_eq!(codex_thread_sandbox(&config), "container");
+    }
+
+    #[test]
+    fn codex_thread_sandbox_prefers_thread_sandbox() {
+        let config = CodexConfig {
+            sandbox: Some("container".into()),
+            thread_sandbox: Some("none".into()),
+            ..CodexConfig::default()
+        };
+
+        assert_eq!(codex_thread_sandbox(&config), "none");
+    }
+
+    #[test]
+    fn codex_turn_sandbox_policy_falls_back_to_thread_sandbox() {
+        let config = CodexConfig {
+            sandbox: Some("container".into()),
+            ..CodexConfig::default()
+        };
+
+        assert_eq!(
+            codex_turn_sandbox_policy(&config, "/tmp/ws"),
+            json!("container")
+        );
+    }
+
+    #[test]
+    fn codex_turn_sandbox_policy_generates_structured_for_workspace_write() {
+        let config = CodexConfig::default();
+        let policy = codex_turn_sandbox_policy(&config, "/tmp/ws");
+
+        assert_eq!(policy["type"], json!("workspaceWrite"));
+        assert_eq!(policy["writableRoots"], json!(["/tmp/ws"]));
+        assert_eq!(
+            policy["readOnlyAccess"],
+            json!({"type": "fullAccess"})
+        );
+        assert_eq!(policy["networkAccess"], json!(false));
+    }
+
+    #[test]
+    fn codex_turn_sandbox_policy_preserves_explicit_policy() {
+        let explicit = json!({"type": "custom", "writableRoots": ["/foo"]});
+        let config = CodexConfig {
+            turn_sandbox_policy: Some(explicit.clone()),
+            ..CodexConfig::default()
+        };
+
+        assert_eq!(codex_turn_sandbox_policy(&config, "/tmp/ws"), explicit);
+    }
+
+    #[test]
+    fn diff_tokens_computes_delta_correctly() {
+        let previous = super::SessionTokens {
+            input_tokens: 10,
+            output_tokens: 5,
+            total_tokens: 15,
+            last_reported_total: 15,
+        };
+        let current = super::SessionTokens {
+            input_tokens: 25,
+            output_tokens: 12,
+            total_tokens: 37,
+            last_reported_total: 37,
+        };
+
+        let delta = super::diff_tokens(&previous, &current);
+
+        assert_eq!(delta.input_tokens, 15);
+        assert_eq!(delta.output_tokens, 7);
+        assert_eq!(delta.total_tokens, 22);
+    }
+
+    #[test]
+    fn diff_tokens_handles_zero_delta() {
+        let tokens = super::SessionTokens {
+            input_tokens: 10,
+            output_tokens: 5,
+            total_tokens: 15,
+            last_reported_total: 15,
+        };
+
+        let delta = super::diff_tokens(&tokens, &tokens);
+
+        assert_eq!(delta.input_tokens, 0);
+        assert_eq!(delta.output_tokens, 0);
+        assert_eq!(delta.total_tokens, 0);
+    }
+
+    #[test]
+    fn session_tokens_to_usage_preserves_all_fields() {
+        let tokens = super::SessionTokens {
+            input_tokens: 100,
+            output_tokens: 200,
+            total_tokens: 300,
+            last_reported_total: 300,
+        };
+
+        let usage = super::session_tokens_to_usage(&tokens);
+
+        assert_eq!(usage.input_tokens, 100);
+        assert_eq!(usage.output_tokens, 200);
+        assert_eq!(usage.total_tokens, 300);
+    }
+
+    #[test]
+    fn zero_token_usage_is_all_zeros() {
+        let usage = super::zero_token_usage();
+
+        assert_eq!(usage.input_tokens, 0);
+        assert_eq!(usage.output_tokens, 0);
+        assert_eq!(usage.total_tokens, 0);
+    }
+
+    #[test]
+    fn codex_command_falls_back_to_default() {
+        let config = CodexConfig::default();
+
+        assert_eq!(super::codex_command(&config), "codex app-server");
+    }
+
+    #[test]
+    fn codex_command_uses_configured_value() {
+        let config = CodexConfig {
+            command: Some("custom-codex".into()),
+            ..CodexConfig::default()
+        };
+
+        assert_eq!(super::codex_command(&config), "custom-codex");
+    }
+
+    #[test]
+    fn codex_command_falls_back_for_empty_string() {
+        let config = CodexConfig {
+            command: Some("".into()),
+            ..CodexConfig::default()
+        };
+
+        assert_eq!(super::codex_command(&config), "codex app-server");
+    }
+
+    #[test]
+    fn codex_command_falls_back_for_whitespace_only() {
+        let config = CodexConfig {
+            command: Some("   ".into()),
+            ..CodexConfig::default()
+        };
+
+        assert_eq!(super::codex_command(&config), "codex app-server");
+    }
+
+    #[test]
+    fn state_matches_is_case_insensitive() {
+        assert!(super::state_matches("Todo", &["todo".into(), "in progress".into()]));
+        assert!(super::state_matches("IN PROGRESS", &["Todo".into(), "In Progress".into()]));
+        assert!(!super::state_matches("Done", &["Todo".into(), "In Progress".into()]));
+    }
+
+    #[test]
+    fn state_matches_handles_whitespace() {
+        assert!(super::state_matches("  Todo  ", &["todo".into()]));
+        assert!(super::state_matches("Todo", &["  todo  ".into()]));
+    }
+
+    #[tokio::test]
+    async fn issue_is_active_returns_true_for_active_state() {
+        let tracker = crate::tracker::MemoryTracker::new(vec![crate::domain::Issue {
+            id: "issue-1".into(),
+            identifier: "SYM-1".into(),
+            title: "Test".into(),
+            description: None,
+            priority: None,
+            state: "In Progress".into(),
+            branch_name: None,
+            url: None,
+            labels: Vec::new(),
+            blocked_by: Vec::new(),
+            created_at: None,
+            updated_at: None,
+        }]);
+        let issue = crate::domain::Issue {
+            id: "issue-1".into(),
+            identifier: "SYM-1".into(),
+            title: "Test".into(),
+            description: None,
+            priority: None,
+            state: "In Progress".into(),
+            branch_name: None,
+            url: None,
+            labels: Vec::new(),
+            blocked_by: Vec::new(),
+            created_at: None,
+            updated_at: None,
+        };
+        let active_states = vec!["In Progress".into(), "Todo".into()];
+
+        let result = super::issue_is_active(&tracker, &issue, &active_states).await;
+
+        assert!(result);
+    }
+
+    #[tokio::test]
+    async fn issue_is_active_returns_false_for_terminal_state() {
+        let tracker = crate::tracker::MemoryTracker::new(vec![crate::domain::Issue {
+            id: "issue-1".into(),
+            identifier: "SYM-1".into(),
+            title: "Test".into(),
+            description: None,
+            priority: None,
+            state: "Done".into(),
+            branch_name: None,
+            url: None,
+            labels: Vec::new(),
+            blocked_by: Vec::new(),
+            created_at: None,
+            updated_at: None,
+        }]);
+        let issue = crate::domain::Issue {
+            id: "issue-1".into(),
+            identifier: "SYM-1".into(),
+            title: "Test".into(),
+            description: None,
+            priority: None,
+            state: "In Progress".into(),
+            branch_name: None,
+            url: None,
+            labels: Vec::new(),
+            blocked_by: Vec::new(),
+            created_at: None,
+            updated_at: None,
+        };
+        let active_states = vec!["In Progress".into(), "Todo".into()];
+
+        let result = super::issue_is_active(&tracker, &issue, &active_states).await;
+
+        assert!(!result);
+    }
+
+    #[tokio::test]
+    async fn issue_is_active_returns_false_when_issue_not_found() {
+        let tracker = crate::tracker::MemoryTracker::new(vec![]);
+        let issue = crate::domain::Issue {
+            id: "missing".into(),
+            identifier: "SYM-X".into(),
+            title: "Test".into(),
+            description: None,
+            priority: None,
+            state: "In Progress".into(),
+            branch_name: None,
+            url: None,
+            labels: Vec::new(),
+            blocked_by: Vec::new(),
+            created_at: None,
+            updated_at: None,
+        };
+        let active_states = vec!["In Progress".into()];
+
+        let result = super::issue_is_active(&tracker, &issue, &active_states).await;
+
+        assert!(!result);
+    }
+
+    #[test]
+    fn codex_approval_policy_empty_string_uses_default() {
+        assert_eq!(
+            codex_approval_policy(Some(&json!(""))),
+            json!({ "autoApprove": ["command_execution", "file_changes"] })
+        );
+    }
+
+    #[test]
+    fn codex_approval_policy_whitespace_only_uses_default() {
+        assert_eq!(
+            codex_approval_policy(Some(&json!("  "))),
+            json!({ "autoApprove": ["command_execution", "file_changes"] })
+        );
+    }
+
+    #[test]
+    fn codex_thread_sandbox_defaults_to_workspace_write() {
+        let config = CodexConfig::default();
+
+        assert_eq!(codex_thread_sandbox(&config), "workspace-write");
+    }
+
+    #[test]
+    fn codex_thread_sandbox_empty_strings_fallback() {
+        let config = CodexConfig {
+            thread_sandbox: Some("".into()),
+            sandbox: Some("  ".into()),
+            ..CodexConfig::default()
+        };
+
+        assert_eq!(codex_thread_sandbox(&config), "workspace-write");
     }
 }

@@ -2,15 +2,19 @@ use std::sync::Arc;
 
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
+use axum::response::sse::{Event, Sse};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use chrono::Utc;
 use serde_json::json;
 use tokio::sync::mpsc;
+use tokio_stream::wrappers::errors::BroadcastStreamRecvError;
+use tokio_stream::wrappers::BroadcastStream;
+use tokio_stream::{Stream, StreamExt};
 use tracing::warn;
 
-use crate::orchestrator::OrchestratorMsg;
+use crate::orchestrator::{OrchestratorMsg, StateSnapshot};
 
 use super::{render_dashboard, StateProvider};
 
@@ -31,6 +35,7 @@ pub fn create_router(
 
     Router::new()
         .route("/", get(dashboard_handler))
+        .route("/api/v1/events", get(get_events))
         .route("/api/v1/state", get(get_state))
         .route("/api/v1/refresh", post(post_refresh))
         .route("/api/v1/{identifier}", get(get_issue_detail))
@@ -41,6 +46,23 @@ pub fn create_router(
 async fn dashboard_handler(State(state): State<AppState>) -> Html<String> {
     let snapshot = state.state_provider.snapshot();
     Html(render_dashboard(&snapshot))
+}
+
+async fn get_events(
+    State(state): State<AppState>,
+) -> Sse<impl Stream<Item = Result<Event, std::convert::Infallible>>> {
+    let rx = state.state_provider.subscribe_events();
+    let initial_snapshot = state.state_provider.snapshot();
+    let initial = tokio_stream::iter(snapshot_event(initial_snapshot));
+    let updates = BroadcastStream::new(rx).filter_map(|result| match result {
+        Ok(snapshot) => snapshot_event(snapshot),
+        Err(BroadcastStreamRecvError::Lagged(skipped)) => {
+            warn!(skipped, "sse client lagged behind state broadcast");
+            None
+        }
+    });
+
+    Sse::new(initial.chain(updates))
 }
 
 async fn get_state(State(state): State<AppState>) -> impl IntoResponse {
@@ -137,17 +159,30 @@ fn error_response(status: StatusCode, code: &str, message: &str) -> Response {
         .into_response()
 }
 
+fn snapshot_event(snapshot: StateSnapshot) -> Option<Result<Event, std::convert::Infallible>> {
+    match Event::default().event("state").json_data(snapshot) {
+        Ok(event) => Some(Ok(event)),
+        Err(error) => {
+            warn!(%error, "failed to serialize state snapshot for sse");
+            None
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
+    use std::time::Duration as StdDuration;
 
-    use axum::body::{to_bytes, Body};
+    use axum::body::{to_bytes, Body, Bytes};
     use axum::http::{Method, Request, StatusCode};
     use axum::Router;
     use chrono::{Duration, Utc};
     use serde_json::json;
     use serde_json::Value;
     use tokio::sync::mpsc;
+    use tokio::time::timeout;
+    use tokio_stream::StreamExt;
     use tower::util::ServiceExt;
 
     use super::create_router;
@@ -170,6 +205,7 @@ mod tests {
                 issue_id: String::from("issue-1"),
                 issue_identifier: String::from("SYM-1"),
                 state: String::from("Todo"),
+                worker_host: Some(String::from("host1")),
                 session_id: String::from("session-1"),
                 turn_count: 2,
                 workspace_path: String::from("/tmp/issue-1"),
@@ -187,6 +223,7 @@ mod tests {
                 attempt: 3,
                 scheduled_at: Utc::now() + Duration::seconds(30),
                 reason: Some(String::from("retry")),
+                worker_host: None,
             }],
             codex_totals: AggregateTokens {
                 input_tokens: 100,
@@ -198,19 +235,19 @@ mod tests {
         }
     }
 
-    fn test_router() -> (Router, mpsc::Receiver<OrchestratorMsg>) {
+    fn test_router() -> (Router, Arc<StateProvider>, mpsc::Receiver<OrchestratorMsg>) {
         let provider = Arc::new(StateProvider::new());
         provider.update(sample_snapshot());
         let (msg_tx, msg_rx) = mpsc::channel(4);
 
-        (create_router(provider, msg_tx), msg_rx)
+        (create_router(provider.clone(), msg_tx), provider, msg_rx)
     }
 
     #[tokio::test]
     // SPEC 17.4 / 17.6: snapshot API returns running rows, retry rows, token totals, and limits.
     async fn state_response_contains_expected_structure() -> Result<(), Box<dyn std::error::Error>>
     {
-        let (app, _) = test_router();
+        let (app, _, _) = test_router();
         let request = Request::builder()
             .method(Method::GET)
             .uri("/api/v1/state")
@@ -233,7 +270,7 @@ mod tests {
     #[tokio::test]
     // SPEC 17.6: refresh requests are operator-visible and queued without crashing the host.
     async fn refresh_response_returns_accepted() -> Result<(), Box<dyn std::error::Error>> {
-        let (app, mut msg_rx) = test_router();
+        let (app, _, mut msg_rx) = test_router();
         let request = Request::builder()
             .method(Method::POST)
             .uri("/api/v1/refresh")
@@ -257,7 +294,7 @@ mod tests {
     #[tokio::test]
     // SPEC 17.4: issue-scoped snapshot lookups surface unavailable issues cleanly.
     async fn issue_not_found_returns_404() -> Result<(), Box<dyn std::error::Error>> {
-        let (app, _) = test_router();
+        let (app, _, _) = test_router();
         let request = Request::builder()
             .method(Method::GET)
             .uri("/api/v1/SYM-404")
@@ -277,7 +314,7 @@ mod tests {
     #[tokio::test]
     // SPEC 17.6: the human-readable dashboard is derived from orchestrator state.
     async fn dashboard_returns_html() -> Result<(), Box<dyn std::error::Error>> {
-        let (app, _) = test_router();
+        let (app, _, _) = test_router();
         let request = Request::builder()
             .method(Method::GET)
             .uri("/")
@@ -299,5 +336,113 @@ mod tests {
         assert!(html.contains("Running Sessions"));
 
         Ok(())
+    }
+
+    #[tokio::test]
+    // SPEC sse-push: SSE endpoint exposes text/event-stream and emits an initial snapshot.
+    async fn sse_endpoint_returns_initial_event() -> Result<(), Box<dyn std::error::Error>> {
+        let (app, _, _) = test_router();
+        let request = Request::builder()
+            .method(Method::GET)
+            .uri("/api/v1/events")
+            .body(Body::empty())?;
+
+        let response = app.oneshot(request).await?;
+        let status = response.status();
+        let content_type = response
+            .headers()
+            .get(axum::http::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned);
+        let mut stream = response.into_body().into_data_stream();
+        let event = read_sse_event(&mut stream).await?;
+        let payload = event_payload(&event)?;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(content_type.as_deref(), Some("text/event-stream"));
+        assert!(event.contains("event: state"));
+        assert_eq!(payload["counts"]["running"], 1);
+        assert_eq!(payload["running"][0]["issue_identifier"], "SYM-1");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    // SPEC sse-push: connected SSE clients receive state snapshots after provider updates.
+    async fn sse_endpoint_receives_published_updates() -> Result<(), Box<dyn std::error::Error>> {
+        let (app, provider, _) = test_router();
+        let request = Request::builder()
+            .method(Method::GET)
+            .uri("/api/v1/events")
+            .body(Body::empty())?;
+
+        let response = app.oneshot(request).await?;
+        let mut stream = response.into_body().into_data_stream();
+        let _ = read_sse_event(&mut stream).await?;
+
+        let mut updated = sample_snapshot();
+        updated.generated_at = Utc::now();
+        updated.counts.running = 2;
+        updated.counts.retrying = 0;
+        updated.retrying.clear();
+        updated.codex_totals.total_tokens = 999;
+        updated.running.push(RunningSnapshot {
+            issue_id: String::from("issue-3"),
+            issue_identifier: String::from("SYM-3"),
+            state: String::from("In Progress"),
+            worker_host: None,
+            session_id: String::from("session-3"),
+            turn_count: 4,
+            workspace_path: String::from("/tmp/issue-3"),
+            started_at: Utc::now() - Duration::seconds(9),
+            last_event_at: Some(Utc::now()),
+            tokens: TokenUsage {
+                input_tokens: 11,
+                output_tokens: 22,
+                total_tokens: 33,
+            },
+        });
+        provider.update(updated);
+
+        let event = read_sse_event(&mut stream).await?;
+        let payload = event_payload(&event)?;
+
+        assert!(event.contains("event: state"));
+        assert_eq!(payload["counts"]["running"], 2);
+        assert_eq!(payload["running"][1]["issue_identifier"], "SYM-3");
+        assert_eq!(payload["codex_totals"]["total_tokens"], 999);
+
+        Ok(())
+    }
+
+    async fn read_sse_event<S>(stream: &mut S) -> Result<String, Box<dyn std::error::Error>>
+    where
+        S: tokio_stream::Stream<Item = Result<Bytes, axum::Error>> + Unpin,
+    {
+        let mut buffer = String::new();
+
+        loop {
+            let next = timeout(StdDuration::from_secs(1), stream.next())
+                .await
+                .map_err(|error| std::io::Error::new(std::io::ErrorKind::TimedOut, error))?;
+            let chunk = next.ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "sse stream ended")
+            })??;
+            buffer.push_str(std::str::from_utf8(&chunk)?);
+
+            if let Some(index) = buffer.find("\n\n") {
+                return Ok(buffer[..index].to_owned());
+            }
+        }
+    }
+
+    fn event_payload(event: &str) -> Result<Value, Box<dyn std::error::Error>> {
+        let data = event
+            .lines()
+            .find_map(|line| line.strip_prefix("data: "))
+            .ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::InvalidData, "missing data field")
+            })?;
+        Ok(serde_json::from_str(data)?)
     }
 }

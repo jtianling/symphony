@@ -8,8 +8,14 @@ use crate::domain::{BlockerRef, Issue};
 use crate::error::SymphonyError;
 
 use super::adapter::{normalize_issue, normalize_issue_ref};
-use super::queries::{CANDIDATE_FETCH_QUERY, FETCH_BY_STATES_QUERY, STATE_REFRESH_QUERY};
-use super::types::{GraphQLResponse, IssuesData, LinearIssue, NodesData};
+use super::queries::{
+    CANDIDATE_FETCH_QUERY, CREATE_COMMENT_MUTATION, FETCH_BY_STATES_QUERY, STATE_LOOKUP_QUERY,
+    STATE_REFRESH_QUERY, UPDATE_STATE_MUTATION, VIEWER_QUERY,
+};
+use super::types::{
+    CommentCreateData, GraphQLResponse, IssueUpdateData, IssuesData, LinearIssue, NodesData,
+    StateLookupData, ViewerData,
+};
 
 const DEFAULT_ENDPOINT: &str = "https://api.linear.app/graphql";
 const REQUEST_TIMEOUT_SECS: u64 = 30;
@@ -100,12 +106,18 @@ impl LinearClient {
         &self,
         config: &TrackerConfig,
     ) -> Result<Vec<Issue>, SymphonyError> {
+        if config.active_states.is_empty() {
+            return Ok(Vec::new());
+        }
+
         let project_slug = project_slug(config)?;
+        let assignee_id = self.resolve_assignee_filter(config).await?;
         let issues = self
             .fetch_paginated_issues(project_slug, &config.active_states, CANDIDATE_FETCH_QUERY)
             .await?;
+        let filtered_issues = filter_issues_by_assignee(issues, assignee_id.as_deref());
 
-        Ok(issues.iter().map(normalize_issue).collect())
+        Ok(filtered_issues.iter().map(normalize_issue).collect())
     }
 
     pub async fn fetch_issues_by_states(
@@ -142,6 +154,47 @@ impl LinearClient {
             .filter_map(|issue| issue.as_ref())
             .map(normalize_issue_ref)
             .collect())
+    }
+
+    pub async fn create_comment(&self, issue_id: &str, body: &str) -> Result<(), SymphonyError> {
+        let data: CommentCreateData = self
+            .execute_typed(
+                CREATE_COMMENT_MUTATION,
+                json!({
+                    "issueId": issue_id,
+                    "body": body,
+                }),
+            )
+            .await?;
+
+        if data.comment_create.success {
+            return Ok(());
+        }
+
+        Err(SymphonyError::Tracker("comment_create_failed".into()))
+    }
+
+    pub async fn update_issue_state(
+        &self,
+        issue_id: &str,
+        state_name: &str,
+    ) -> Result<(), SymphonyError> {
+        let state_id = self.resolve_state_id(issue_id, state_name).await?;
+        let data: IssueUpdateData = self
+            .execute_typed(
+                UPDATE_STATE_MUTATION,
+                json!({
+                    "issueId": issue_id,
+                    "stateId": state_id,
+                }),
+            )
+            .await?;
+
+        if data.issue_update.success {
+            return Ok(());
+        }
+
+        Err(SymphonyError::Tracker("issue_update_failed".into()))
     }
 
     async fn execute_typed<T>(&self, query: &str, variables: Value) -> Result<T, SymphonyError>
@@ -190,6 +243,54 @@ impl LinearClient {
         }
 
         Ok(issues)
+    }
+
+    async fn resolve_state_id(
+        &self,
+        issue_id: &str,
+        state_name: &str,
+    ) -> Result<String, SymphonyError> {
+        let data: StateLookupData = self
+            .execute_typed(
+                STATE_LOOKUP_QUERY,
+                json!({
+                    "issueId": issue_id,
+                    "stateName": state_name,
+                }),
+            )
+            .await?;
+
+        data.issue
+            .and_then(|issue| issue.team)
+            .and_then(|team| team.states.nodes.into_iter().next())
+            .map(|state| state.id)
+            .ok_or_else(|| SymphonyError::Tracker("state_not_found".into()))
+    }
+
+    async fn resolve_assignee_filter(
+        &self,
+        config: &TrackerConfig,
+    ) -> Result<Option<String>, SymphonyError> {
+        let assignee = config
+            .assignee
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+
+        match assignee {
+            None => Ok(None),
+            Some("me") => self.fetch_viewer_id().await.map(Some),
+            Some(value) => Ok(Some(value.to_owned())),
+        }
+    }
+
+    async fn fetch_viewer_id(&self) -> Result<String, SymphonyError> {
+        let data: ViewerData = self.execute_typed(VIEWER_QUERY, json!({})).await?;
+
+        data.viewer
+            .map(|viewer| viewer.id)
+            .filter(|id| !id.trim().is_empty())
+            .ok_or_else(|| SymphonyError::Tracker("viewer_not_found".into()))
     }
 }
 
@@ -251,17 +352,58 @@ where
         .ok_or_else(|| SymphonyError::LinearUnknownPayload("missing GraphQL data".into()))
 }
 
+fn filter_issues_by_assignee(
+    issues: Vec<LinearIssue>,
+    assignee_id: Option<&str>,
+) -> Vec<LinearIssue> {
+    let Some(assignee_id) = assignee_id.map(str::trim).filter(|value| !value.is_empty()) else {
+        return issues;
+    };
+
+    issues
+        .into_iter()
+        .filter(|issue| {
+            issue
+                .assignee
+                .as_ref()
+                .map(|assignee| assignee.id.trim() == assignee_id)
+                .unwrap_or(false)
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
-    use serde_json::json;
+    use serde_json::{json, Value};
     use wiremock::matchers::{body_partial_json, header, method};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     use super::{fetch_issues_by_states, LinearClient};
     use crate::config::TrackerConfig;
     use crate::error::SymphonyError;
-    use crate::linear::queries::FETCH_BY_STATES_QUERY;
+    use crate::linear::queries::{
+        CANDIDATE_FETCH_QUERY, CREATE_COMMENT_MUTATION, FETCH_BY_STATES_QUERY, STATE_LOOKUP_QUERY,
+        UPDATE_STATE_MUTATION, VIEWER_QUERY,
+    };
     use crate::linear::types::IssuesData;
+
+    fn candidate_issue_json(id: &str, identifier: &str, assignee: Option<&str>) -> Value {
+        json!({
+            "id": id,
+            "identifier": identifier,
+            "title": identifier,
+            "description": null,
+            "priority": null,
+            "branchName": null,
+            "url": null,
+            "createdAt": null,
+            "updatedAt": null,
+            "state": { "name": "Todo" },
+            "assignee": assignee.map(|value| json!({ "id": value })).unwrap_or(Value::Null),
+            "labels": { "nodes": [] },
+            "inverseRelations": { "nodes": [] }
+        })
+    }
 
     #[tokio::test]
     // SPEC 17.3: empty state filters return without issuing a Linear API call.
@@ -479,6 +621,497 @@ mod tests {
         assert_eq!(issues.len(), 2);
         assert_eq!(issues[0].identifier, "SYM-1");
         assert_eq!(issues[1].identifier, "SYM-2");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn fetch_candidates_returns_all_issues_without_assignee_filter(
+    ) -> Result<(), SymphonyError> {
+        let server = MockServer::start().await;
+        let client = LinearClient::with_endpoint("linear-key", server.uri())?;
+        let config = TrackerConfig {
+            project_slug: Some("project".into()),
+            active_states: vec!["Todo".into()],
+            ..TrackerConfig::default()
+        };
+
+        Mock::given(method("POST"))
+            .and(body_partial_json(json!({
+                "query": CANDIDATE_FETCH_QUERY,
+                "variables": {
+                    "projectSlug": "project",
+                    "states": ["Todo"],
+                    "after": null
+                }
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": {
+                    "issues": {
+                        "nodes": [
+                            candidate_issue_json("1", "SYM-1", Some("user-1")),
+                            candidate_issue_json("2", "SYM-2", None)
+                        ],
+                        "pageInfo": {
+                            "hasNextPage": false,
+                            "endCursor": null
+                        }
+                    }
+                }
+            })))
+            .mount(&server)
+            .await;
+
+        let issues = client.fetch_candidates(&config).await?;
+
+        assert_eq!(issues.len(), 2);
+        assert_eq!(issues[0].identifier, "SYM-1");
+        assert_eq!(issues[1].identifier, "SYM-2");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn fetch_candidates_filters_by_explicit_assignee_id() -> Result<(), SymphonyError> {
+        let server = MockServer::start().await;
+        let client = LinearClient::with_endpoint("linear-key", server.uri())?;
+        let config = TrackerConfig {
+            project_slug: Some("project".into()),
+            assignee: Some("user-1".into()),
+            active_states: vec!["Todo".into()],
+            ..TrackerConfig::default()
+        };
+
+        Mock::given(method("POST"))
+            .and(body_partial_json(json!({
+                "query": CANDIDATE_FETCH_QUERY,
+                "variables": {
+                    "projectSlug": "project",
+                    "states": ["Todo"],
+                    "after": null
+                }
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": {
+                    "issues": {
+                        "nodes": [
+                            candidate_issue_json("1", "SYM-1", Some("user-1")),
+                            candidate_issue_json("2", "SYM-2", Some("user-2")),
+                            candidate_issue_json("3", "SYM-3", None)
+                        ],
+                        "pageInfo": {
+                            "hasNextPage": false,
+                            "endCursor": null
+                        }
+                    }
+                }
+            })))
+            .mount(&server)
+            .await;
+
+        let issues = client.fetch_candidates(&config).await?;
+
+        assert_eq!(issues.len(), 1);
+        assert_eq!(issues[0].identifier, "SYM-1");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn fetch_candidates_resolves_me_to_viewer_id() -> Result<(), SymphonyError> {
+        let server = MockServer::start().await;
+        let client = LinearClient::with_endpoint("linear-key", server.uri())?;
+        let config = TrackerConfig {
+            project_slug: Some("project".into()),
+            assignee: Some("me".into()),
+            active_states: vec!["Todo".into()],
+            ..TrackerConfig::default()
+        };
+
+        Mock::given(method("POST"))
+            .and(body_partial_json(json!({
+                "query": VIEWER_QUERY,
+                "variables": {}
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": {
+                    "viewer": {
+                        "id": "viewer-1"
+                    }
+                }
+            })))
+            .mount(&server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(body_partial_json(json!({
+                "query": CANDIDATE_FETCH_QUERY,
+                "variables": {
+                    "projectSlug": "project",
+                    "states": ["Todo"],
+                    "after": null
+                }
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": {
+                    "issues": {
+                        "nodes": [
+                            candidate_issue_json("1", "SYM-1", Some("viewer-1")),
+                            candidate_issue_json("2", "SYM-2", Some("user-2")),
+                            candidate_issue_json("3", "SYM-3", None)
+                        ],
+                        "pageInfo": {
+                            "hasNextPage": false,
+                            "endCursor": null
+                        }
+                    }
+                }
+            })))
+            .mount(&server)
+            .await;
+
+        let issues = client.fetch_candidates(&config).await?;
+
+        assert_eq!(issues.len(), 1);
+        assert_eq!(issues[0].identifier, "SYM-1");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn fetch_candidates_propagates_viewer_query_failures() -> Result<(), SymphonyError> {
+        let server = MockServer::start().await;
+        let client = LinearClient::with_endpoint("linear-key", server.uri())?;
+        let config = TrackerConfig {
+            project_slug: Some("project".into()),
+            assignee: Some("me".into()),
+            active_states: vec!["Todo".into()],
+            ..TrackerConfig::default()
+        };
+
+        Mock::given(method("POST"))
+            .and(body_partial_json(json!({
+                "query": VIEWER_QUERY,
+                "variables": {}
+            })))
+            .respond_with(ResponseTemplate::new(500).set_body_string("viewer failed"))
+            .mount(&server)
+            .await;
+
+        let error = match client.fetch_candidates(&config).await {
+            Ok(_) => panic!("expected viewer query failure"),
+            Err(error) => error,
+        };
+
+        assert!(matches!(
+            error,
+            SymphonyError::LinearApiStatus { status: 500, .. }
+        ));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn create_comment_succeeds() -> Result<(), SymphonyError> {
+        let server = MockServer::start().await;
+        let client = LinearClient::with_endpoint("linear-key", server.uri())?;
+
+        Mock::given(method("POST"))
+            .and(header("authorization", "linear-key"))
+            .and(body_partial_json(json!({
+                "query": CREATE_COMMENT_MUTATION,
+                "variables": {
+                    "issueId": "issue-1",
+                    "body": "hello"
+                }
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": {
+                    "commentCreate": {
+                        "success": true
+                    }
+                }
+            })))
+            .mount(&server)
+            .await;
+
+        client.create_comment("issue-1", "hello").await
+    }
+
+    #[tokio::test]
+    async fn create_comment_propagates_api_errors() -> Result<(), SymphonyError> {
+        let server = MockServer::start().await;
+        let client = LinearClient::with_endpoint("linear-key", server.uri())?;
+
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(502).set_body_string("bad gateway"))
+            .mount(&server)
+            .await;
+
+        let error = match client.create_comment("issue-1", "hello").await {
+            Ok(_) => panic!("expected api failure"),
+            Err(error) => error,
+        };
+
+        assert!(matches!(
+            error,
+            SymphonyError::LinearApiStatus { status: 502, .. }
+        ));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn create_comment_propagates_graphql_errors() -> Result<(), SymphonyError> {
+        let server = MockServer::start().await;
+        let client = LinearClient::with_endpoint("linear-key", server.uri())?;
+
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "errors": [{ "message": "comment failed" }]
+            })))
+            .mount(&server)
+            .await;
+
+        let error = match client.create_comment("issue-1", "hello").await {
+            Ok(_) => panic!("expected graphql failure"),
+            Err(error) => error,
+        };
+
+        assert!(matches!(error, SymphonyError::LinearGraphqlErrors { .. }));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn create_comment_rejects_unsuccessful_mutation() -> Result<(), SymphonyError> {
+        let server = MockServer::start().await;
+        let client = LinearClient::with_endpoint("linear-key", server.uri())?;
+
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": {
+                    "commentCreate": {
+                        "success": false
+                    }
+                }
+            })))
+            .mount(&server)
+            .await;
+
+        let error = match client.create_comment("issue-1", "hello").await {
+            Ok(_) => panic!("expected unsuccessful mutation"),
+            Err(error) => error,
+        };
+
+        assert!(matches!(
+            error,
+            SymphonyError::Tracker(ref message) if message == "comment_create_failed"
+        ));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn update_issue_state_succeeds() -> Result<(), SymphonyError> {
+        let server = MockServer::start().await;
+        let client = LinearClient::with_endpoint("linear-key", server.uri())?;
+
+        Mock::given(method("POST"))
+            .and(body_partial_json(json!({
+                "query": STATE_LOOKUP_QUERY,
+                "variables": {
+                    "issueId": "issue-1",
+                    "stateName": "Done"
+                }
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": {
+                    "issue": {
+                        "team": {
+                            "states": {
+                                "nodes": [
+                                    { "id": "state-1" }
+                                ]
+                            }
+                        }
+                    }
+                }
+            })))
+            .mount(&server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(body_partial_json(json!({
+                "query": UPDATE_STATE_MUTATION,
+                "variables": {
+                    "issueId": "issue-1",
+                    "stateId": "state-1"
+                }
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": {
+                    "issueUpdate": {
+                        "success": true
+                    }
+                }
+            })))
+            .mount(&server)
+            .await;
+
+        client.update_issue_state("issue-1", "Done").await
+    }
+
+    #[tokio::test]
+    async fn update_issue_state_errors_when_state_is_missing() -> Result<(), SymphonyError> {
+        let server = MockServer::start().await;
+        let client = LinearClient::with_endpoint("linear-key", server.uri())?;
+
+        Mock::given(method("POST"))
+            .and(body_partial_json(json!({
+                "query": STATE_LOOKUP_QUERY,
+                "variables": {
+                    "issueId": "issue-1",
+                    "stateName": "Missing"
+                }
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": {
+                    "issue": {
+                        "team": {
+                            "states": {
+                                "nodes": []
+                            }
+                        }
+                    }
+                }
+            })))
+            .mount(&server)
+            .await;
+
+        let error = match client.update_issue_state("issue-1", "Missing").await {
+            Ok(_) => panic!("expected missing state failure"),
+            Err(error) => error,
+        };
+
+        assert!(matches!(
+            error,
+            SymphonyError::Tracker(ref message) if message == "state_not_found"
+        ));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn update_issue_state_propagates_api_errors() -> Result<(), SymphonyError> {
+        let server = MockServer::start().await;
+        let client = LinearClient::with_endpoint("linear-key", server.uri())?;
+
+        Mock::given(method("POST"))
+            .and(body_partial_json(json!({
+                "query": STATE_LOOKUP_QUERY,
+                "variables": {
+                    "issueId": "issue-1",
+                    "stateName": "Done"
+                }
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": {
+                    "issue": {
+                        "team": {
+                            "states": {
+                                "nodes": [
+                                    { "id": "state-1" }
+                                ]
+                            }
+                        }
+                    }
+                }
+            })))
+            .mount(&server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(body_partial_json(json!({
+                "query": UPDATE_STATE_MUTATION,
+                "variables": {
+                    "issueId": "issue-1",
+                    "stateId": "state-1"
+                }
+            })))
+            .respond_with(ResponseTemplate::new(503).set_body_string("unavailable"))
+            .mount(&server)
+            .await;
+
+        let error = match client.update_issue_state("issue-1", "Done").await {
+            Ok(_) => panic!("expected api failure"),
+            Err(error) => error,
+        };
+
+        assert!(matches!(
+            error,
+            SymphonyError::LinearApiStatus { status: 503, .. }
+        ));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn update_issue_state_rejects_unsuccessful_mutation() -> Result<(), SymphonyError> {
+        let server = MockServer::start().await;
+        let client = LinearClient::with_endpoint("linear-key", server.uri())?;
+
+        Mock::given(method("POST"))
+            .and(body_partial_json(json!({
+                "query": STATE_LOOKUP_QUERY,
+                "variables": {
+                    "issueId": "issue-1",
+                    "stateName": "Done"
+                }
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": {
+                    "issue": {
+                        "team": {
+                            "states": {
+                                "nodes": [
+                                    { "id": "state-1" }
+                                ]
+                            }
+                        }
+                    }
+                }
+            })))
+            .mount(&server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(body_partial_json(json!({
+                "query": UPDATE_STATE_MUTATION,
+                "variables": {
+                    "issueId": "issue-1",
+                    "stateId": "state-1"
+                }
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": {
+                    "issueUpdate": {
+                        "success": false
+                    }
+                }
+            })))
+            .mount(&server)
+            .await;
+
+        let error = match client.update_issue_state("issue-1", "Done").await {
+            Ok(_) => panic!("expected unsuccessful mutation"),
+            Err(error) => error,
+        };
+
+        assert!(matches!(
+            error,
+            SymphonyError::Tracker(ref message) if message == "issue_update_failed"
+        ));
 
         Ok(())
     }

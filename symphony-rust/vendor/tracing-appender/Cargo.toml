@@ -1,0 +1,8 @@
+[package]
+name = "tracing-appender"
+version = "0.0.0"
+edition = "2021"
+
+[lib]
+name = "tracing_appender"
+path = "src/lib.rs"
